@@ -1,0 +1,38 @@
+# voice-type configuration
+# Copy to: ~/.config/voice-type/config.toml
+# All settings are optional — CLI arguments always override these values.
+
+[recording]
+key      = "F9"       # Hotkey: F1–F12
+model    = "medium"   # Whisper model: tiny | base | small | medium | large-v3
+language = "de"       # Language code or "auto" for auto-detect
+engine   = "faster"   # faster | openai | api
+beam_size = 5         # 1 = fast, 5 = accurate
+# prompt = "Python, FastAPI, TypeScript"  # domain hints for better accuracy
+
+[vad]
+enabled        = true   # silero-vad for smart silence detection (recommended)
+threshold      = 0.5    # speech probability threshold (0.0–1.0)
+min_silence_ms = 2500   # ms of silence after speech before stopping
+
+[duck]
+enabled    = true  # reduce background audio during recording
+sink_level = 10    # target volume % (10 = quiet, 30 = still audible)
+
+[sounds]
+# start = "/path/to/start.mp3"  # custom start sound (optional)
+# stop  = "/path/to/stop.mp3"   # custom stop sound (optional)
+
+# ── API Engine (--engine api) ───────────────────────────────────
+# Use any OpenAI-compatible transcription API instead of a local model.
+# No GPU or large downloads required.
+#
+# Examples:
+#   OpenAI:  base_url = "https://api.openai.com/v1",  model = "whisper-1"
+#   Groq:    base_url = "https://api.groq.com/openai/v1", model = "whisper-large-v3"
+#   Local:   base_url = "http://localhost:8080",       model = "whisper-1"
+#
+[api]
+# base_url = "https://api.groq.com/openai/v1"
+# api_key  = "gsk_your_key_here"   # or set OPENAI_API_KEY env var
+# model    = "whisper-large-v3"

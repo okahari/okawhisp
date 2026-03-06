@@ -8,8 +8,10 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for transcripti
 
 ## Features
 
-- **Global hotkey** (F9 by default) — works in any window
+- **Global hotkey** (F9 by default, configurable) — works in any window
 - **Auto-stop** via ML-based Voice Activity Detection (silero-vad) — stops when you stop talking, not on a fixed timer
+- **Three transcription engines:** local faster-whisper (GPU), local openai-whisper, or any OpenAI-compatible API (OpenAI, Groq, local server)
+- **Config file** (`~/.config/voice-type/config.toml`) — set all defaults without touching CLI args
 - **Audio ducking** — background music fades to 10% during recording, restores afterward
 - **GPU-accelerated** transcription via faster-whisper (CUDA) or CPU fallback
 - **Bluetooth mic support** — handles Jabra and other BT headsets with persistent PyAudio stream
@@ -96,8 +98,52 @@ python voice-type.py --language en --model small
 # German, best quality
 python voice-type.py --language de --model large-v3 --beam-size 5
 
+# OpenAI API (no local model / GPU needed)
+python voice-type.py --engine api --api-key sk-...
+
+# Groq API (free tier, very fast)
+python voice-type.py --engine api \
+  --api-url https://api.groq.com/openai/v1 \
+  --api-key gsk_... \
+  --api-model whisper-large-v3
+
 # With domain hints for better accuracy
 python voice-type.py --prompt "Python, FastAPI, Kubernetes, TypeScript"
+```
+
+### Config File
+
+Copy the example and edit to taste:
+
+```bash
+mkdir -p ~/.config/voice-type
+cp config.example.toml ~/.config/voice-type/config.toml
+```
+
+Example `~/.config/voice-type/config.toml`:
+
+```toml
+[recording]
+key      = "F9"
+model    = "large-v3"
+language = "de"
+engine   = "faster"
+
+[vad]
+enabled        = true
+threshold      = 0.5
+min_silence_ms = 2500
+
+[duck]
+sink_level = 10
+
+# Use Groq instead of local model:
+# [recording]
+# engine = "api"
+# [api]
+# base_url = "https://api.groq.com/openai/v1"
+# api_key  = "gsk_..."
+# model    = "whisper-large-v3"
 ```
 
 ---

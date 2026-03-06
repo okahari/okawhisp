@@ -7,3 +7,5 @@ venv/
 *.log
 *.mp3
 *.wav
+# Don't commit personal config (may contain API keys)
+config.toml

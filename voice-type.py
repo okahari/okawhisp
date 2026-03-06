@@ -10,15 +10,21 @@ Funktioniert mit Claude Code, jedem Terminal, jedem Editor.
 
 Engines:
   - faster-whisper (Standard): 4x schneller als OpenAI Whisper, CTranslate2
-  - openai-whisper (Fallback): Original OpenAI Implementation
+  - openai-whisper: Original OpenAI Implementation (lokal)
+  - api: OpenAI-kompatible API (OpenAI, Groq, lokaler Whisper-Server, …)
+
+Config File (optional):
+  ~/.config/voice-type/config.toml  →  Defaults setzen, kein CLI nötig
 
 Verwendung:
-  python voice-type.py                        # Standard: F9, medium, deutsch
-  python voice-type.py --key F8               # Anderer Hotkey
-  python voice-type.py --model small          # Kleineres Modell
-  python voice-type.py --language en          # Englisch
-  python voice-type.py --engine openai        # Original Whisper Engine
-  python voice-type.py --prompt "NestJS, Flutter, friyon-core"  # Kontext-Hints
+  python voice-type.py                          # Standard: F9, medium, deutsch
+  python voice-type.py --key F8                 # Anderer Hotkey
+  python voice-type.py --model small            # Kleineres Modell
+  python voice-type.py --language en            # Englisch
+  python voice-type.py --engine openai          # Lokales OpenAI Whisper
+  python voice-type.py --engine api             # OpenAI-kompatible API
+  python voice-type.py --api-url https://api.groq.com/openai/v1 --api-key KEY
+  python voice-type.py --prompt "NestJS, Flutter"  # Kontext-Hints
 """
 
 import pyaudio
@@ -31,8 +37,18 @@ import signal
 import argparse
 import warnings
 import os
+import io
+import wave
 import logging
+from pathlib import Path
 from datetime import datetime
+try:
+    import tomllib          # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib   # pip install tomli (Fallback für Python < 3.11)
+    except ImportError:
+        tomllib = None
 from ctypes import cdll, c_char_p, c_int, CFUNCTYPE
 
 warnings.filterwarnings("ignore")
@@ -101,6 +117,62 @@ DUCK_SINK_LEVEL = 10        # % auf den alle Sinks reduziert werden (Catch-All f
 # Benutzerdefinierte Sounds (werden bevorzugt abgespielt, falls vorhanden)
 CUSTOM_RECORD_START_SOUND = None  # Optional: Pfad zu einer MP3-Datei, z.B. "/home/user/sounds/start.mp3"
 CUSTOM_RECORD_END_SOUND = None    # Optional: Pfad zu einer MP3-Datei, z.B. "/home/user/sounds/stop.mp3"
+
+# ── OpenAI-kompatible API (engine=api) ───────────────────────────
+# Funktioniert mit: OpenAI, Groq, lokaler whisper.cpp-Server, u.a.
+WHISPER_API_BASE_URL = "https://api.openai.com/v1"
+WHISPER_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+WHISPER_API_MODEL    = "whisper-1"
+
+# ─── Config File ─────────────────────────────────────────────────
+
+def load_config() -> dict:
+    """Lädt ~/.config/voice-type/config.toml (oder ~/.voice-type.toml).
+
+    Gibt leeres Dict zurück wenn kein Config-File gefunden oder TOML nicht verfügbar.
+    CLI-Argumente haben immer Vorrang über Config-File-Werte.
+
+    Beispiel config.toml:
+        [recording]
+        key = "F9"
+        model = "large-v3"
+        language = "de"
+        engine = "faster"
+
+        [vad]
+        enabled = true
+        threshold = 0.5
+        min_silence_ms = 2500
+
+        [duck]
+        enabled = true
+        sink_level = 10
+
+        [sounds]
+        start = "/pfad/zu/start.mp3"
+        stop  = "/pfad/zu/stop.mp3"
+
+        [api]
+        base_url = "https://api.groq.com/openai/v1"
+        api_key  = "gsk_..."
+        model    = "whisper-large-v3"
+    """
+    if tomllib is None:
+        return {}
+    config_paths = [
+        Path.home() / ".config" / "voice-type" / "config.toml",
+        Path.home() / ".voice-type.toml",
+    ]
+    for path in config_paths:
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    cfg = tomllib.load(f)
+                log.info(f"  ⚙️  Config geladen: {path}")
+                return cfg
+            except Exception as e:
+                log.warning(f"  ⚠️  Config-Fehler ({path}): {e}")
+    return {}
 
 # ─── Globale Variablen ───────────────────────────────────────────
 
@@ -245,6 +317,69 @@ def transcribe_openai_whisper(audio_np):
         condition_on_previous_text=True,
     )
     return result['text'].strip(), result.get('language', '?')
+
+
+def transcribe_via_api(audio_np):
+    """Transkription via OpenAI-kompatibler API.
+
+    Funktioniert mit:
+      - OpenAI (api.openai.com)        → WHISPER_API_MODEL = "whisper-1"
+      - Groq   (api.groq.com/openai/v1) → WHISPER_API_MODEL = "whisper-large-v3"
+      - lokaler whisper.cpp Server      → WHISPER_API_BASE_URL = "http://localhost:8080"
+      - jeder anderen OpenAI-kompatiblen Endpoint
+
+    Konfiguration via Config-File [api] oder --api-url / --api-key CLI-Args.
+    API-Key kann auch als Umgebungsvariable OPENAI_API_KEY gesetzt werden.
+    """
+    try:
+        import urllib.request
+        import urllib.error
+        import json
+
+        # Audio als WAV in Memory-Buffer schreiben
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)   # int16
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes((audio_np * 32768).astype(np.int16).tobytes())
+        wav_buf.seek(0)
+        audio_bytes = wav_buf.read()
+
+        # Multipart/form-data manuell bauen (kein requests nötig)
+        boundary = "voicetype_boundary_xk29"
+        def field(name, value):
+            return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f'{value}\r\n').encode()
+        def file_field(name, filename, content_type, data):
+            header = (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; '
+                      f'filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n').encode()
+            return header + data + b'\r\n'
+
+        body = (field("model", WHISPER_API_MODEL) +
+                field("response_format", "json"))
+        if LANGUAGE:
+            body += field("language", LANGUAGE)
+        if INITIAL_PROMPT:
+            body += field("prompt", INITIAL_PROMPT)
+        body += file_field("file", "audio.wav", "audio/wav", audio_bytes)
+        body += f"--{boundary}--\r\n".encode()
+
+        url = f"{WHISPER_API_BASE_URL.rstrip('/')}/audio/transcriptions"
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if WHISPER_API_KEY:
+            headers["Authorization"] = f"Bearer {WHISPER_API_KEY}"
+
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            text = result.get("text", "").strip()
+            lang = result.get("language", LANGUAGE or "?")
+            return text, lang
+
+    except Exception as e:
+        log.error(f"  [api] ❌ API-Transkription fehlgeschlagen: {e}")
+        raise
 
 
 def _play_pcm_sound(samples, sample_rate=44100):
@@ -897,7 +1032,9 @@ def _run_voice_input():
     log.info(f"  [7] Transkribiere ({duration:.1f}s Audio, engine={engine_type})...")
     t0 = time.time()
     try:
-        if engine_type == "faster":
+        if engine_type == "api":
+            text, lang = transcribe_via_api(audio_np)
+        elif engine_type == "faster":
             text, lang = transcribe_faster_whisper(audio_np)
         else:
             text, lang = transcribe_openai_whisper(audio_np)
@@ -1018,36 +1155,70 @@ def main():
     global model, should_exit, engine_type
     global MODEL_SIZE, LANGUAGE, ENGINE, BEAM_SIZE, INITIAL_PROMPT
     global SILENCE_DURATION, SILENCE_THRESHOLD
+    global VAD_ENABLED, VAD_THRESHOLD, VAD_MIN_SILENCE_MS
+    global DUCK_AUDIO_DURING_RECORDING, DUCK_SINK_LEVEL
+    global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
+    global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
+
+    # ── Config File laden (Defaults) ─────────────────────────────
+    cfg = load_config()
+    rec = cfg.get("recording", {})
+    vad = cfg.get("vad", {})
+    duck = cfg.get("duck", {})
+    sounds = cfg.get("sounds", {})
+    api_cfg = cfg.get("api", {})
+
+    # Config-Werte als Defaults (CLI überschreibt diese)
+    if vad.get("enabled") is not None:    VAD_ENABLED        = vad["enabled"]
+    if vad.get("threshold"):              VAD_THRESHOLD      = float(vad["threshold"])
+    if vad.get("min_silence_ms"):         VAD_MIN_SILENCE_MS = int(vad["min_silence_ms"])
+    if duck.get("enabled") is not None:   DUCK_AUDIO_DURING_RECORDING = duck["enabled"]
+    if duck.get("sink_level"):            DUCK_SINK_LEVEL    = int(duck["sink_level"])
+    if sounds.get("start"):               CUSTOM_RECORD_START_SOUND = sounds["start"]
+    if sounds.get("stop"):                CUSTOM_RECORD_END_SOUND   = sounds["stop"]
+    if api_cfg.get("base_url"):           WHISPER_API_BASE_URL = api_cfg["base_url"]
+    if api_cfg.get("api_key"):            WHISPER_API_KEY      = api_cfg["api_key"]
+    if api_cfg.get("model"):              WHISPER_API_MODEL    = api_cfg["model"]
 
     parser = argparse.ArgumentParser(
         description='Voice Type - System-Level Voice Input',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
-  python voice-type.py                                    # Standard (F9, medium, deutsch)
-  python voice-type.py --model small --language en        # Englisch, schneller
-  python voice-type.py --prompt "NestJS, Flutter, API"    # Fachbegriffe als Kontext
-  python voice-type.py --beam-size 1                      # Schneller, etwas ungenauer
-  python voice-type.py --engine openai                    # Original Whisper Engine
-  python voice-type.py --silence 3.0 --threshold 300      # Empfindlichere Stille-Erkennung
+  python voice-type.py                                       # Standard (F9, medium, deutsch)
+  python voice-type.py --model small --language en           # Englisch, schneller
+  python voice-type.py --engine api --api-key sk-...         # OpenAI API
+  python voice-type.py --engine api \\
+    --api-url https://api.groq.com/openai/v1 --api-key gsk_  # Groq (kostenlos, schnell)
+  python voice-type.py --prompt "NestJS, Flutter, API"       # Fachbegriffe als Kontext
+  python voice-type.py --beam-size 1                         # Schneller, etwas ungenauer
+
+Config File: ~/.config/voice-type/config.toml
         """
     )
-    parser.add_argument('--key', default='F9',
+    parser.add_argument('--key', default=rec.get('key', 'F9'),
                         help='Hotkey für Aufnahme (F1-F12, default: F9)')
-    parser.add_argument('--model', default='medium',
+    parser.add_argument('--model', default=rec.get('model', 'medium'),
                         help='Whisper Modell: tiny/base/small/medium/large-v3 (default: medium)')
-    parser.add_argument('--language', default='de',
+    parser.add_argument('--language', default=rec.get('language', 'de'),
                         help='Sprache: de/en/fr/es/... oder "auto" (default: de)')
-    parser.add_argument('--engine', default='faster', choices=['faster', 'openai'],
-                        help='Whisper Engine: faster (4x schneller) oder openai (default: faster)')
-    parser.add_argument('--beam-size', type=int, default=5,
+    parser.add_argument('--engine', default=rec.get('engine', 'faster'),
+                        choices=['faster', 'openai', 'api'],
+                        help='Engine: faster | openai (lokal) | api (OpenAI-kompatibel)')
+    parser.add_argument('--beam-size', type=int, default=rec.get('beam_size', 5),
                         help='Beam Search Größe: 1=schnell, 5=genau (default: 5)')
-    parser.add_argument('--prompt', default=None,
+    parser.add_argument('--prompt', default=rec.get('prompt', None),
                         help='Kontext-Prompt für bessere Erkennung von Fachbegriffen')
-    parser.add_argument('--silence', type=float, default=2.0,
+    parser.add_argument('--silence', type=float, default=rec.get('silence', 2.0),
                         help='Stille-Dauer in Sekunden bis Auto-Stopp (default: 2.0)')
     parser.add_argument('--threshold', type=int, default=200,
-                        help='Stille-Schwellwert RMS (default: 200, niedrigerer=empfindlicher)')
+                        help='Stille-Schwellwert RMS (default: 200)')
+    parser.add_argument('--api-url', default=None,
+                        help='API Base-URL für engine=api (default: OpenAI)')
+    parser.add_argument('--api-key', default=None,
+                        help='API Key für engine=api (oder OPENAI_API_KEY Env-Var)')
+    parser.add_argument('--api-model', default=None,
+                        help='Modell-Name für engine=api (default: whisper-1)')
     args = parser.parse_args()
 
     MODEL_SIZE = args.model
@@ -1058,6 +1229,11 @@ Beispiele:
     SILENCE_DURATION = args.silence
     SILENCE_THRESHOLD = args.threshold
     engine_type = args.engine
+
+    # API-Konfiguration (CLI überschreibt Config-File)
+    if args.api_url:   WHISPER_API_BASE_URL = args.api_url
+    if args.api_key:   WHISPER_API_KEY      = args.api_key
+    if args.api_model: WHISPER_API_MODEL    = args.api_model
 
     print()
     print("=" * 60)
@@ -1104,14 +1280,19 @@ Beispiele:
     except Exception:
         pass
 
-    if _server_available:
+    if engine_type == "api":
+        # Kein lokales Modell nötig — Transkription via API
+        api_host = WHISPER_API_BASE_URL.split("/")[2] if "//" in WHISPER_API_BASE_URL else WHISPER_API_BASE_URL
+        print(f"  🌐 API-Engine: {api_host} (Modell: {WHISPER_API_MODEL})")
+        if not WHISPER_API_KEY:
+            print(f"  ⚠️  Kein API-Key gesetzt — setze OPENAI_API_KEY oder --api-key")
+    elif _server_available:
         print(f"  ✅ whisper-server erreichbar ({WHISPER_SERVER_URL}) — kein lokales Modell nötig")
         print(f"  🔗 Nutze Server-GPU für Transkription")
     else:
-        # Whisper-Modell lokal laden (Fallback)
+        # Whisper-Modell lokal laden
         print(f"  📦 Lade Whisper-Modell '{MODEL_SIZE}' ({engine_type} engine)...")
         load_start = time.time()
-
         try:
             if engine_type == "faster":
                 model = load_model_faster_whisper(MODEL_SIZE, device)
@@ -1158,10 +1339,15 @@ Beispiele:
     print()
     print("─" * 60)
     print(f"  ⚙️  Konfiguration:")
-    print(f"     Engine:      {engine_type}-whisper")
-    print(f"     Modell:      {MODEL_SIZE}")
+    if engine_type == "api":
+        api_host = WHISPER_API_BASE_URL.split("/")[2] if "//" in WHISPER_API_BASE_URL else WHISPER_API_BASE_URL
+        print(f"     Engine:      api  ({api_host})")
+        print(f"     API-Modell:  {WHISPER_API_MODEL}")
+    else:
+        print(f"     Engine:      {engine_type}-whisper")
+        print(f"     Modell:      {MODEL_SIZE}")
+        print(f"     Beam Size:   {BEAM_SIZE}")
     print(f"     Sprache:     {LANGUAGE or 'auto-detect'}")
-    print(f"     Beam Size:   {BEAM_SIZE}")
     print(f"     Prompt:      {INITIAL_PROMPT or '(keiner)'}")
     print(f"     VAD:         {vad_status}")
     print(f"     Max Dauer:   {MAX_RECORD_SECONDS}s")
