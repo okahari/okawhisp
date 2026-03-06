@@ -1,0 +1,34 @@
+[Unit]
+Description=Voice Type - System-Level Voice Input (F9 Hotkey)
+After=graphical-session.target pipewire.service
+
+[Service]
+Type=simple
+# Adjust paths to your venv and script location:
+ExecStart=/path/to/venv/bin/python /path/to/voice-type.py \
+    --key F9 \
+    --model large-v3 \
+    --engine faster \
+    --language de \
+    --beam-size 5 \
+    --silence 2.0
+
+# X11 + Audio access
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/home/YOUR_USER/.Xauthority"
+Environment="XDG_RUNTIME_DIR=/run/user/YOUR_UID"
+Environment="PYTHONUNBUFFERED=1"
+Environment="CUDA_VISIBLE_DEVICES=0"
+
+Restart=always
+RestartSec=5s
+
+MemoryMax=4G
+MemoryHigh=3G
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-type
+
+[Install]
+WantedBy=graphical-session.target
