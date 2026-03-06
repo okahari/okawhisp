@@ -1,4 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "pyaudio",
+#   "numpy",
+#   "faster-whisper",
+#   "silero-vad>=6.0",
+#   "torch",
+# ]
+# ///
 """
 Voice Type - System-Level Voice-to-Text für jedes Fenster
 ==========================================================

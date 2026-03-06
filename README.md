@@ -42,35 +42,41 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for transcripti
 
 ## Installation
 
-### 1. Install system dependencies
-
 ```bash
-sudo apt install xdotool xclip python3-dev portaudio19-dev
+curl -sSL https://raw.githubusercontent.com/YOUR_USER/voice-type/main/install.sh | bash
 ```
 
-### 2. Create a virtual environment
+That's it. The installer handles system packages, Python dependencies, and the systemd service.
+
+> **First start:** The Whisper model (~1–3 GB) is downloaded on first use — this takes a minute.
+> Subsequent starts are instant.
+
+### Manual installation
+
+If you prefer to set things up yourself:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+# System packages
+sudo apt install xdotool portaudio19-dev python3-dev
 
-### 3. Install Python dependencies
+# Install uv (fast Python manager) if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-```bash
-pip install -r requirements.txt
-```
-
-> **Note:** PyTorch with CUDA is recommended for fastest transcription.
-> Install it separately if needed: https://pytorch.org/get-started/locally/
-
-### 4. Run
-
-```bash
-python voice-type.py
+# Run directly — uv manages all Python dependencies automatically
+uv run voice-type.py
 ```
 
 Press **F9** to start recording. Speak. It stops automatically when you stop talking.
+
+### As a systemd service (auto-start)
+
+Copy the example service file, adjust paths, and enable:
+
+```bash
+cp voice-type.service.example ~/.config/systemd/user/voice-type.service
+# Edit DISPLAY and XAUTHORITY if needed (run: echo $DISPLAY $XAUTHORITY)
+systemctl --user enable --now voice-type.service
+```
 
 ---
 
