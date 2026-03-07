@@ -161,3 +161,4 @@ echo "  Logs:    journalctl --user -u okawhisp -f"
 echo "  Restart: systemctl --user restart okawhisp"
 echo "  Config:  ~/.config/okawhisp/config.toml"
 echo ""
+# Updated Sa 07 Mär 2026 06:34:01 CET
