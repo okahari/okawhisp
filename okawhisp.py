@@ -19,8 +19,9 @@ Config File (optional):
   ~/.config/okawhisp/config.toml  →  set defaults, no CLI needed
 
 Usage:
-  python okawhisp.py                          # Default: F9, medium, German
+  python okawhisp.py                          # Default: AltGr, medium, German
   python okawhisp.py --key F8                 # Different hotkey
+  python okawhisp.py --key ALT_GR             # Explicit AltGr hotkey
   python okawhisp.py --model small            # Smaller model
   python okawhisp.py --language en            # English
   python okawhisp.py --engine openai          # Local OpenAI Whisper
@@ -111,10 +112,10 @@ VAD_MIN_SILENCE_MS = 2500   # Silence after last speech until auto-stop
 VAD_MIN_SPEECH_MS  = 200    # Minimum speech before stop counter activates
 VAD_CHUNK_SAMPLES  = 512    # silero requires exactly 512 samples at 16kHz (32ms)
 
-# Audio ducking: Reduce other apps volume during recording
-# Sink-input ducking (other apps) + sink volume reduction as catch-all
+# Audio ducking: only regulate sink/master volume during recording.
+# We intentionally do NOT touch per-app sink-input volumes.
 DUCK_AUDIO_DURING_RECORDING = True
-DUCK_SINK_LEVEL = 5         # % to reduce all sinks to (catch-all for music etc.)
+DUCK_SINK_LEVEL = 0         # % to reduce sinks to while recording
 
 # Custom sounds (played if available)
 # Sounds: automatically loaded from ~/.local/share/okawhisp/sounds/ (by installer)
@@ -138,7 +139,7 @@ def load_config() -> dict:
 
     Example config.toml:
         [recording]
-        key = "F9"
+        key = "ALT_GR"
         model = "large-v3"
         language = "de"
         engine = "faster"
@@ -185,9 +186,10 @@ should_exit = False
 engine_type = "faster"
 _vad_model = None           # silero-vad Modell (loaded beim Start)
 
-# Statt eines einfachen bool: Lock verhindert Race-Condition wenn F9 schnell
+# Statt eines einfachen bool: Lock verhindert Race-Condition bei schnellen Hotkey-Presses
 # mehrfach pressed wird (bool-Check + bool-Set ist kein atomarer Vorgang).
 _recording_lock = threading.Lock()
+_ptt_stop_requested = False  # PTT mode: stop when key released
 
 # Persistente PyAudio-Instanz und Stream — werden einmal beim Start erstellt.
 # Stream wird per stop_stream()/start_stream() an/abgeschaltet, nie geschlossen.
@@ -411,12 +413,13 @@ def _play_pcm_sound(samples, sample_rate=44100):
         return False
 
 
-def _play_audio_file(file_path, volume_boost: float = 1.0):
-    """Spielt eine Audio-Datei asynchron ab (ffplay bevorzugt, paplay fallback).
+def _play_audio_file(file_path, volume_boost: float = 1.0, blocking: bool = False):
+    """Spielt eine Audio-Datei ab (ffplay bevorzugt, paplay fallback).
     
     Args:
         file_path: Pfad zur Audio-Datei
         volume_boost: Volume multiplier (1.0 = normal, 2.0 = doppelt so laut)
+        blocking: If True, wait until playback has finished.
     """
     if not file_path or not os.path.isfile(file_path):
         return False
@@ -428,17 +431,26 @@ def _play_audio_file(file_path, volume_boost: float = 1.0):
             # Volume filter for volume adjustment
             cmd.extend(['-af', f'volume={volume_boost}'])
         cmd.append(file_path)
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if blocking:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except FileNotFoundError:
         pass
 
     # Fallback (works well for WAV/OGA, no volume boost support).
     try:
-        subprocess.Popen(
-            ['paplay', file_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        if blocking:
+            subprocess.run(
+                ['paplay', file_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
+        else:
+            subprocess.Popen(
+                ['paplay', file_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
         return True
     except FileNotFoundError:
         return False
@@ -498,12 +510,13 @@ def _soft_end_buzzer_sound(sample_rate=44100):
     return (signal * envelope * 0.30).astype(np.float32)
 
 
-def play_sound(sound_name, volume_boost: float = 1.0):
+def play_sound(sound_name, volume_boost: float = 1.0, blocking: bool = False):
     """Feedback-Sound abspielen.
     
     Args:
         sound_name: Name des Sounds (record_start, record_end)
         volume_boost: Volume multiplier (for sounds during ducking)
+        blocking: If True, wait until playback has finished.
     """
     custom_file_map = {
         "record_start": CUSTOM_RECORD_START_SOUND,
@@ -511,7 +524,7 @@ def play_sound(sound_name, volume_boost: float = 1.0):
     }
 
     # 1) Benutzerdateien haben Vorrang.
-    if _play_audio_file(custom_file_map.get(sound_name), volume_boost=volume_boost):
+    if _play_audio_file(custom_file_map.get(sound_name), volume_boost=volume_boost, blocking=blocking):
         return
 
     # 2) Synthetic sounds as fallback (no volume boost possible).
@@ -527,10 +540,16 @@ def play_sound(sound_name, volume_boost: float = 1.0):
     # Fallback to system sounds (e.g. if output device temporarily blocked).
     try:
         sound_path = f'/usr/share/sounds/freedesktop/stereo/{sound_name}.oga'
-        subprocess.Popen(
-            ['paplay', sound_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        if blocking:
+            subprocess.run(
+                ['paplay', sound_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
+        else:
+            subprocess.Popen(
+                ['paplay', sound_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
     except FileNotFoundError:
         pass
 
@@ -572,6 +591,8 @@ DUCK_FADE_STEPS = 15        # Number of steps for smooth volume fade
 DUCK_FADE_DURATION = 1.0    # Seconds for fade to 0%
 DUCK_PRE_SOUND_PAUSE = 1.0  # Seconds of silence before start sound
 DUCK_POST_SOUND_PAUSE = 2.0 # Seconds pause after stop sound before music fades back
+SOUND_VOLUME_BOOST = 1.0    # Fixed playback gain for start/stop sounds
+SOUND_SINK_LEVEL = 75       # Fixed sink loudness (%) for start/stop sounds
 
 
 def _parse_sink_inputs_by_pid() -> tuple[list, list]:
@@ -901,19 +922,22 @@ def record_with_silence_detection(audio_stream, threshold: int = None):
     return frames
 
 
-def record_with_vad(audio_stream) -> list:
+def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
     """Nimmt Audio auf mit silero-vad Voice Activity Detection.
 
     Liest 512-Sample Chunks (32ms bei 16kHz), analysiert jeden per silero-vad.
     Stoppt wenn nach erkannter Sprache VAD_MIN_SILENCE_MS Silence folgt.
     Returns all recorded bytes (incl. pre-speech frames) for Whisper.
+    
+    ptt_mode: If True, stop when _ptt_stop_requested becomes True (key released).
 
     State-Machine:
         WAITING  → warte auf erste Sprache (aber akkumuliere Audio)
         SPEAKING → Speech detected, silence counter running
-        STOPPED  → Silence-Timeout erreicht
+        STOPPED  → Silence-Timeout erreicht (or PTT key released)
     """
     import torch
+    global _ptt_stop_requested
 
     vad_chunk = VAD_CHUNK_SAMPLES                            # 512 Samples = 32ms
     ms_per_chunk = vad_chunk / SAMPLE_RATE * 1000           # = 32ms
@@ -929,6 +953,11 @@ def record_with_vad(audio_stream) -> list:
     total_chunks    = 0
 
     while total_chunks < max_total_chunks:
+        # PTT mode: stop immediately when key released
+        if ptt_mode and _ptt_stop_requested:
+            elapsed_ms = total_chunks * ms_per_chunk
+            log.info(f"  PTT: 🛑 Key released → Stopp (t={elapsed_ms:.0f}ms)")
+            break
         try:
             data = audio_stream.read(vad_chunk, exception_on_overflow=False)
         except Exception as e:
@@ -1029,26 +1058,40 @@ def _check_mic_ready(max_wait_s: float = 3.0) -> bool:
     return False
 
 
-def do_voice_input():
-    """Hauptfunktion: Aufnehmen → Transcribingn → Typing"""
+def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
+    """Hauptfunktion: Aufnehmen → Transcribingn → Typing
+    
+    ptt_mode: If True, Push-to-Talk mode (stop on key release, send with Enter)
+    skip_start_sound: If True, start sound was already played (PTT mode)
+    """
+    global _ptt_stop_requested
 
-    # Lock statt bool: verhindert Race-Condition bei schnell-mehrfachem F9
+    # Lock statt bool: verhindert Race-Condition bei schnell-mehrfachem Hotkey
     if not _recording_lock.acquire(blocking=False):
-        log.debug("F9 ignored — Recording readys (Lock gehalten)")
+        log.debug("Hotkey ignored — Recording already running (Lock gehalten)")
         return
 
+    # Reset PTT stop flag
+    _ptt_stop_requested = False
+    
+    mode_str = "PTT" if ptt_mode else "Toggle"
     log.info("━" * 60)
-    log.info("▶  F9 pressed — Recording sequence starting")
+    log.info(f"▶  Recording sequence starting ({mode_str} mode)")
     try:
-        _run_voice_input()
+        _run_voice_input(ptt_mode=ptt_mode, skip_start_sound=skip_start_sound)
     finally:
+        _ptt_stop_requested = False
         _recording_lock.release()
         log.info("◀  Recording sequence finished")
         log.info("━" * 60)
 
 
-def _run_voice_input():
-    """Actual recording logic (runs under _recording_lock)."""
+def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
+    """Actual recording logic (runs under _recording_lock).
+    
+    ptt_mode: If True, PTT mode - stop on key release, send with Enter at end.
+    skip_start_sound: If True, start sound was already played externally.
+    """
     global _audio_stream
 
     # ── 1. Stream-Status checkingn & starten ──────────────────────
@@ -1090,27 +1133,41 @@ def _run_voice_input():
             notify("❌ Audio-Error", f"Mic not ready: {e}", "critical")
             return
 
-    # ── 2b. Other sink inputs erfassen ────────────────────────────
-    # Duckt nur andere Apps (Spotify, Browser etc.), nicht unsere eigenen Sounds
-    _original_inputs = {}
+    # ── 2b. Sink-Volumes erfassen (kein per-app Ducking) ─────────
+    _original_sinks = {}
     if DUCK_AUDIO_DURING_RECORDING:
-        _original_inputs = _get_other_sink_inputs()
-        log.info(f"  [2b] 📊 Other sink inputs: {len(_original_inputs)} found")
+        _original_sinks = _get_all_sinks()
+        log.info(f"  [2b] 📊 Sinks captured: {len(_original_sinks)}")
 
-    # ── 2c. Music auf 0% faden (sanfter Übergang) ────────────────
-    if DUCK_AUDIO_DURING_RECORDING and _original_inputs:
-        log.info(f"  [2c] 🔇 Fade: Music → 0% ({DUCK_FADE_DURATION}s)")
-        _fade_sink_inputs_to(_original_inputs, 0)
-        # Silence vor dem Start-Sound
-        log.info(f"  [2c] 🤫 Silence pause ({DUCK_PRE_SOUND_PAUSE}s)")
-        time.sleep(DUCK_PRE_SOUND_PAUSE)
+    # ── 2c. Sink-Volumes absenken (sanfter Übergang) ─────────────
+    # Skip in PTT mode (too slow, sound already played)
+    if not skip_start_sound:
+        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
+            log.info(f"  [2c] 🔉 Fade: Sinks → {DUCK_SINK_LEVEL}% ({DUCK_FADE_DURATION}s)")
+            _fade_sinks_to(_original_sinks, DUCK_SINK_LEVEL)
+            # Silence vor dem Start-Sound
+            log.info(f"  [2c] 🤫 Silence pause ({DUCK_PRE_SOUND_PAUSE}s)")
+            time.sleep(DUCK_PRE_SOUND_PAUSE)
 
-    # ── 2d. Start-Sound (full volume, Music bleibt stumm) ───
-    # sink inputs der anderen Apps sind auf 0%, unser Sound geht direkt durch
-    log.info("  [2d] 🔔 Start-Sound")
-    play_sound("record_start")
-    notify("🔴 Recording", "Speak now...")
-    time.sleep(0.5)   # Sound fertig abspielen lassen
+        # ── 2d. Start-Sound
+        log.info(f"  [2d] 🔔 Start-Sound @ {SOUND_SINK_LEVEL}%")
+        _chime_other_inputs = {}
+        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
+            # Keep background apps muted while temporarily raising sink for chime.
+            _chime_other_inputs = _get_other_sink_inputs()
+            if _chime_other_inputs:
+                _fade_sink_inputs_to(_chime_other_inputs, 0, duration=0.05)
+            _set_sink_volumes(_original_sinks, {sid: SOUND_SINK_LEVEL for sid in _original_sinks})
+        play_sound("record_start")
+        notify("🔴 Recording", "Speak now...")
+        time.sleep(0.5)   # Sound fertig abspielen lassen
+        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
+            _set_sink_volumes(_original_sinks, {sid: DUCK_SINK_LEVEL for sid in _original_sinks})
+            if _chime_other_inputs:
+                _restore_sink_inputs(_chime_other_inputs, duration=0.05)
+    else:
+        log.info("  [2d] ⏭️  Start-Sound skipped (PTT mode)")
+        notify("🔴 PTT Recording", "Speak...")
 
     # ── 2e. Kalibrierung (nur RMS-Fallback) ──────────────────────
     use_vad = VAD_ENABLED and _vad_model is not None
@@ -1122,16 +1179,16 @@ def _run_voice_input():
 
     if use_vad:
         log.info(f"  [3] 🔴 Recording (VAD, threshold={VAD_THRESHOLD}, "
-                 f"min_silence={VAD_MIN_SILENCE_MS}ms, musik=stumm)")
+                 f"min_silence={VAD_MIN_SILENCE_MS}ms, sink_level={DUCK_SINK_LEVEL}%)")
     else:
         log.info(f"  [3] 🔴 Recording (RMS, Silence-Limit={SILENCE_DURATION}s, "
-                 f"Threshold={dynamic_threshold}, musik=stumm)")
+                 f"Threshold={dynamic_threshold}, sink_level={DUCK_SINK_LEVEL}%)")
 
     # ── 4. Recording ─────────────────────────────────────────────
     record_start_ts = time.time()
     try:
         if use_vad:
-            frames = record_with_vad(_audio_stream)
+            frames = record_with_vad(_audio_stream, ptt_mode=ptt_mode)
         else:
             frames = record_with_silence_detection(_audio_stream, threshold=dynamic_threshold)
     except Exception as e:
@@ -1146,16 +1203,31 @@ def _run_voice_input():
         except Exception as ex:
             log.warning(f"  [4] stop_stream() Error: {ex}")
 
-    # ── 5. Stop-Sound (Music ist noch stumm) ───────────────────────
-    log.info("  [5] 🔔 Stop-Sound")
-    play_sound("record_end")
-    
-    # ── 5b. Pause after stop sound, dann Music hochfahren ─────────
-    if DUCK_AUDIO_DURING_RECORDING and _original_inputs:
+    # ── 5. Stop-Sound (Music ist noch geduckt) ─────────────────────
+    # In PTT mode, stop sound was already played on key release
+    if not ptt_mode:
+        log.info(f"  [5] 🔔 Stop-Sound @ {SOUND_SINK_LEVEL}%")
+        _chime_other_inputs = {}
+        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
+            _chime_other_inputs = _get_other_sink_inputs()
+            if _chime_other_inputs:
+                _fade_sink_inputs_to(_chime_other_inputs, 0, duration=0.05)
+            _set_sink_volumes(_original_sinks, {sid: SOUND_SINK_LEVEL for sid in _original_sinks})
+        play_sound("record_end")
+        time.sleep(0.5)
+        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
+            _set_sink_volumes(_original_sinks, {sid: DUCK_SINK_LEVEL for sid in _original_sinks})
+            if _chime_other_inputs:
+                _restore_sink_inputs(_chime_other_inputs, duration=0.05)
+    else:
+        log.info("  [5] ⏭️  Stop-Sound skipped (PTT mode, already played)")
+
+    # ── 5b. Pause after stop sound, dann Sinks auf Originalwerte ───
+    if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
         log.info(f"  [5b] ⏸️  Pause after stop sound ({DUCK_POST_SOUND_PAUSE}s)")
         time.sleep(DUCK_POST_SOUND_PAUSE)
-        log.info(f"  [5c] 🔊 Music fading up ({DUCK_FADE_DURATION}s)")
-        _restore_sink_inputs(_original_inputs)
+        log.info(f"  [5c] 🔊 Restoring sink volumes ({DUCK_FADE_DURATION}s)")
+        _set_sink_volumes(_original_sinks, _original_sinks)
     else:
         time.sleep(0.3)
 
@@ -1204,6 +1276,15 @@ def _run_voice_input():
     if typed:
         notify("✅ Typed", text[:80])
         log.info("  [8] ✅ Text typed into window")
+        
+        # PTT mode: press Enter to send
+        if ptt_mode:
+            time.sleep(0.1)
+            try:
+                subprocess.run(['xdotool', 'key', 'Return'], check=True, timeout=2)
+                log.info("  [8] ⏎  PTT mode: Enter pressed (message sent)")
+            except Exception as e:
+                log.warning(f"  [8] ⚠️  PTT Enter failed: {e}")
     else:
         notify("⚠️ Error", "Typing failed (xdotool)", urgency="critical")
         log.error("  [8] ❌ xdotool typing failed")
@@ -1214,6 +1295,8 @@ def listen_keyboard_hotkey(hotkey):
     try:
         from pynput import keyboard
 
+        alt_gr_key = getattr(keyboard.Key, 'alt_gr', None) or getattr(keyboard.Key, 'alt_r', None)
+
         key_map = {
             'F1': keyboard.Key.f1, 'F2': keyboard.Key.f2,
             'F3': keyboard.Key.f3, 'F4': keyboard.Key.f4,
@@ -1223,21 +1306,115 @@ def listen_keyboard_hotkey(hotkey):
             'F11': keyboard.Key.f11, 'F12': keyboard.Key.f12,
         }
 
-        target_key = key_map.get(hotkey.upper())
-        if not target_key:
+        # AltGr aliases (layout-dependent naming)
+        if alt_gr_key is not None:
+            key_map.update({
+                'ALT_GR': alt_gr_key,
+                'ALTGR': alt_gr_key,
+                'RIGHT_ALT': alt_gr_key,
+                'RALT': alt_gr_key,
+            })
+
+        hotkey_norm = hotkey.upper().replace('-', '_').replace(' ', '_')
+        target_key = key_map.get(hotkey_norm)
+        
+        # AltGr special handling: on Linux/X11 systems AltGr can be various keysyms
+        # See: /usr/include/X11/keysymdef.h
+        altgr_vk_codes = {
+            65027,  # 0xFE03 = XK_ISO_Level3_Shift (AltGr on European ISO keyboards: DE, CH, FR, etc.)
+            65406,  # 0xFF7E = XK_Alt_R (Right Alt on US keyboards)
+            65312,  # 0xFF20 = XK_Multi_key (Compose, sometimes used)
+            65511,  # 0xFFE7 = XK_Meta_L (rare)
+            65512,  # 0xFFE8 = XK_Meta_R (rare)
+            65513,  # 0xFFE9 = XK_Alt_L 
+            65514,  # 0xFFEA = XK_Alt_R (alternative)
+            108,    # Some systems report raw keycode 108 for AltGr
+        }
+        is_altgr_hotkey = hotkey_norm in ('ALT_GR', 'ALTGR', 'RIGHT_ALT', 'RALT')
+        
+        if not target_key and not is_altgr_hotkey:
             print(f"  ❌ Unbekannter Hotkey: {hotkey}")
-            print(f"     Available: {', '.join(key_map.keys())}")
+            print(f"     Available: {', '.join(sorted(set(key_map.keys())))}")
             sys.exit(1)
 
+        # PTT (Push-to-Talk) state
+        ptt_state = {
+            'press_time': None,
+            'ptt_active': False,
+            'ptt_threshold': 0.3,  # 300ms to trigger PTT mode
+        }
+
+        def is_hotkey(key):
+            """Check if key matches configured hotkey"""
+            if target_key and key == target_key:
+                return True
+            if is_altgr_hotkey and hasattr(key, 'vk') and key.vk in altgr_vk_codes:
+                return True
+            return False
+
         def on_press(key):
-            if key == target_key and not _recording_lock.locked():
-                thread = threading.Thread(target=do_voice_input, daemon=True)
+            if not is_hotkey(key):
+                return
+            
+            # Debug: Log every hotkey press
+            log.debug(f"🔑 Hotkey PRESS detected: {key}")
+            
+            # Already recording? Ignore
+            if _recording_lock.locked():
+                log.debug("🔑 Ignored (recording in progress)")
+                return
+            
+            # Record press time for PTT detection
+            if ptt_state['press_time'] is None:
+                ptt_state['press_time'] = time.time()
+                ptt_state['ptt_active'] = False
+                
+                # Start delayed PTT check
+                def check_ptt():
+                    time.sleep(ptt_state['ptt_threshold'])
+                    if ptt_state['press_time'] is not None and not _recording_lock.locked():
+                        # Still held after threshold → PTT mode
+                        ptt_state['ptt_active'] = True
+                        log.info("▶  PTT mode — Recording while key held")
+                        # Play start sound IMMEDIATELY
+                        play_sound("record_start", volume_boost=SOUND_VOLUME_BOOST)
+                        thread = threading.Thread(target=lambda: do_voice_input(ptt_mode=True, skip_start_sound=True), daemon=True)
+                        thread.start()
+                
+                threading.Thread(target=check_ptt, daemon=True).start()
+
+        def on_release(key):
+            if not is_hotkey(key):
+                return
+            
+            # Debug: Log every hotkey release
+            log.debug(f"🔑 Hotkey RELEASE detected: {key}")
+            
+            press_duration = time.time() - ptt_state['press_time'] if ptt_state['press_time'] else 0
+            was_ptt = ptt_state['ptt_active']
+            
+            # Reset state
+            ptt_state['press_time'] = None
+            ptt_state['ptt_active'] = False
+            
+            if was_ptt:
+                # PTT mode: stop recording (handled in do_voice_input via flag)
+                log.info(f"◀  PTT release after {press_duration:.1f}s — Stopping")
+                # Play stop sound IMMEDIATELY
+                play_sound("record_end", volume_boost=SOUND_VOLUME_BOOST)
+                global _ptt_stop_requested
+                _ptt_stop_requested = True
+            elif press_duration < ptt_state['ptt_threshold'] and not _recording_lock.locked():
+                # Short press: toggle mode (original behavior)
+                log.info("▶  Short press — Toggle mode")
+                thread = threading.Thread(target=lambda: do_voice_input(ptt_mode=False), daemon=True)
                 thread.start()
 
         print(f"  🎹 Hotkey: {hotkey}")
         print(f"  📍 Methode: pynput (global keyboard listener)")
+        print(f"  📍 PTT-Modus: Taste ≥300ms halten = Push-to-Talk")
 
-        with keyboard.Listener(on_press=on_press) as listener:
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
 
     except ImportError:
@@ -1284,7 +1461,7 @@ def main():
     if vad.get("threshold"):              VAD_THRESHOLD      = float(vad["threshold"])
     if vad.get("min_silence_ms"):         VAD_MIN_SILENCE_MS = int(vad["min_silence_ms"])
     if duck.get("enabled") is not None:   DUCK_AUDIO_DURING_RECORDING = duck["enabled"]
-    if duck.get("sink_level"):            DUCK_SINK_LEVEL    = int(duck["sink_level"])
+    if duck.get("sink_level") is not None: DUCK_SINK_LEVEL   = int(duck["sink_level"])
     if sounds.get("start"):               CUSTOM_RECORD_START_SOUND = sounds["start"]
     if sounds.get("stop"):                CUSTOM_RECORD_END_SOUND   = sounds["stop"]
     if api_cfg.get("base_url"):           WHISPER_API_BASE_URL = api_cfg["base_url"]
@@ -1296,7 +1473,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
-  python okawhisp.py                                       # Standard (F9, medium, deutsch)
+  python okawhisp.py                                       # Standard (AltGr, medium, deutsch)
   python okawhisp.py --model small --language en           # Englisch, schneller
   python okawhisp.py --engine api --api-key sk-...         # OpenAI API
   python okawhisp.py --engine api \\
@@ -1307,8 +1484,8 @@ Beispiele:
 Config File: ~/.config/voice-type/config.toml
         """
     )
-    parser.add_argument('--key', default=rec.get('key', 'F9'),
-                        help='Recording hotkey (F1-F12, default: F9)')
+    parser.add_argument('--key', default=rec.get('key', 'ALT_GR'),
+                        help='Recording hotkey (ALT_GR or F1-F12, default: ALT_GR)')
     parser.add_argument('--model', default=rec.get('model', 'medium'),
                         help='Whisper Model: tiny/base/small/medium/large-v3 (default: medium)')
     parser.add_argument('--language', default=rec.get('language', 'de'),
