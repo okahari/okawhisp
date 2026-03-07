@@ -216,68 +216,61 @@ else
     systemctl --user start okawhisp.service
 fi
 
-# Wait for service to be ready (model loaded)
+# ── 6. Download Whisper model BEFORE starting service ────────────────────────
+echo ""
+info "Downloading Whisper model '${WHISPER_MODEL}'..."
 echo ""
 
-# Estimate download time based on model size
-case "$WHISPER_MODEL" in
-    tiny)     ESTIMATED_SEC=10; MODEL_MB=75 ;;
-    base)     ESTIMATED_SEC=20; MODEL_MB=145 ;;
-    small)    ESTIMATED_SEC=60; MODEL_MB=470 ;;
-    medium)   ESTIMATED_SEC=120; MODEL_MB=1500 ;;
-    large-v3) ESTIMATED_SEC=240; MODEL_MB=3000 ;;
-    *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
-esac
+python3 << 'DOWNLOAD_SCRIPT'
+import sys
+import os
+from huggingface_hub import snapshot_download
 
-info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
+model_name = os.environ.get("WHISPER_MODEL", "small")
+repo_map = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large": "Systran/faster-whisper-large-v3",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+repo_id = repo_map.get(model_name, repo_map["small"])
+cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+
+try:
+    print(f"  Downloading from: {repo_id}")
+    model_path = snapshot_download(repo_id=repo_id, cache_dir=cache_dir)
+    print(f"\n  ✓ Model ready in cache")
+    sys.exit(0)
+except Exception as e:
+    print(f"\n  ✗ Download failed: {e}", file=sys.stderr)
+    sys.exit(1)
+DOWNLOAD_SCRIPT
+
+if [ $? -ne 0 ]; then
+    err "Model download failed"
+fi
+
+ok "Model downloaded"
+
+# ── 7. Wait for service to be ready ───────────────────────────────────────────
 echo ""
+info "Starting service (model will load from cache)..."
 
-MAX_WAIT=600  # 10 minutes
+MAX_WAIT=60  # Should be fast now - model is already downloaded
 WAITED=0
-SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${WHISPER_MODEL}"
 
 while [ $WAITED -lt $MAX_WAIT ]; do
-    # Check if service crashed
-    if ! systemctl --user is-active --quiet okawhisp.service; then
-        echo ""
-        err "Service crashed! Check logs: journalctl --user -u okawhisp -f"
-    fi
-    
-    # Check if service is ready (hotkey listener started)
+    # Check if service is ready
     if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -qE "(Starte Hotkey|🎹 Hotkey)"; then
-        # Clear line and show completion
-        echo -ne "\r\033[K"
-        echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100% ✓ Model loaded!"
-        echo ""
         ok "Service ready!"
         break
     fi
     
-    # Calculate real progress based on downloaded size
-    if [ -d "$MODEL_CACHE_DIR" ]; then
-        DOWNLOADED_KB=$(du -sk "$MODEL_CACHE_DIR" 2>/dev/null | cut -f1)
-        DOWNLOADED_MB=$((DOWNLOADED_KB / 1024))
-        PROGRESS=$((DOWNLOADED_MB * 100 / MODEL_MB))
-        [ $PROGRESS -gt 99 ] && PROGRESS=99
-    else
-        # Model download hasn't started yet
-        PROGRESS=0
-    fi
-    
-    # Draw progress bar
-    FILLED=$((PROGRESS / 5))
-    EMPTY=$((20 - FILLED))
-    BAR=$(printf "${GREEN}▓%.0s${NC}" $(seq 1 $FILLED))$(printf "░%.0s" $(seq 1 $EMPTY))
-    
-    # Spinner animation
-    SPIN_IDX=$((WAITED % 10))
-    SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
-    
-    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}% (${DOWNLOADED_MB:-0}/${MODEL_MB} MB)"
-    
-    sleep 2
-    WAITED=$((WAITED + 2))
+    sleep 1
+    WAITED=$((WAITED + 1))
 done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
