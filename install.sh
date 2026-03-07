@@ -237,8 +237,8 @@ WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 while [ $WAITED -lt $MAX_WAIT ]; do
-    # Check if service is ready (hotkey listener started OR model loading message)
-    if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -q "Hotkey-Listener"; then
+    # Check if service is ready (hotkey listener started)
+    if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -qE "(Starte Hotkey|🎹 Hotkey)"; then
         # Clear line and show completion
         echo -ne "\r\033[K"
         echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100% ✓ Model loaded!"
