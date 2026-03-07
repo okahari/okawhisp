@@ -138,40 +138,15 @@ if command -v nvidia-smi &>/dev/null; then
     fi
 fi
 
-if   [ "$VRAM_GB" -ge 8 ]; then RECOMMENDED="large-v3"; REASON="(8+ GB VRAM — best quality)"
-elif [ "$VRAM_GB" -ge 6 ]; then RECOMMENDED="medium";   REASON="(6-8 GB VRAM — high quality)"
-elif [ "$VRAM_GB" -ge 4 ]; then RECOMMENDED="small";    REASON="(4-6 GB VRAM — good quality)"
-elif [ "$VRAM_GB" -ge 2 ]; then RECOMMENDED="base";     REASON="(2-4 GB VRAM — decent quality)"
-else                             RECOMMENDED="tiny";     REASON="(CPU / low VRAM — fast)"
+if   [ "$VRAM_GB" -ge 8 ]; then WHISPER_MODEL="large-v3"; REASON="8+ GB VRAM"
+elif [ "$VRAM_GB" -ge 6 ]; then WHISPER_MODEL="medium";   REASON="6-8 GB VRAM"
+elif [ "$VRAM_GB" -ge 4 ]; then WHISPER_MODEL="small";    REASON="4-6 GB VRAM"
+elif [ "$VRAM_GB" -ge 2 ]; then WHISPER_MODEL="base";     REASON="2-4 GB VRAM"
+else                             WHISPER_MODEL="tiny";     REASON="CPU / low VRAM"
 fi
 
-echo ""
-info "Whisper model selection:"
-echo ""
-echo "  tiny     — 75 MB,   very fast, decent quality"
-echo "  base     — 145 MB,  fast,      good quality"
-echo "  small    — 470 MB,  medium,    good quality"
-echo "  medium   — 1.5 GB,  slower,    high quality"
-echo "  large-v3 — 3 GB,    slowest,   best quality"
-echo ""
-echo "  Recommended for your system: ${RECOMMENDED} ${REASON}"
-echo ""
-# </dev/tty so read works even when script is piped via curl | bash
-read -rp "  Choose model [${RECOMMENDED}]: " MODEL_CHOICE </dev/tty
-MODEL_CHOICE="${MODEL_CHOICE:-$RECOMMENDED}"
+info "Model: ${WHISPER_MODEL} (${REASON})"
 
-case "$MODEL_CHOICE" in
-    tiny)         WHISPER_MODEL="tiny" ;;
-    base)         WHISPER_MODEL="base" ;;
-    small)        WHISPER_MODEL="small" ;;
-    medium)       WHISPER_MODEL="medium" ;;
-    large|large-v3) WHISPER_MODEL="large-v3" ;;
-    *)            WHISPER_MODEL="$RECOMMENDED"
-                  # Re-apply mapping in case RECOMMENDED is a display name (e.g. "large")
-                  [ "$WHISPER_MODEL" = "large" ] && WHISPER_MODEL="large-v3" ;;
-esac
-
-# Map model name to HuggingFace repo
 case "$WHISPER_MODEL" in
     tiny)     HF_REPO="Systran/faster-whisper-tiny" ;;
     base)     HF_REPO="Systran/faster-whisper-base" ;;
