@@ -323,31 +323,49 @@ EOF
             systemctl --user start okawhisp.service
         fi
 
-        # Stream filtered service output until ready signal is found (or timeout)
+        # Display: stream filtered journal output in background (visual only)
+        # Detection: poll journal snapshots in foreground (avoids journalctl -f deadlock)
         echo ""
         info "Starting service..."
         echo ""
 
-        EXIT_CODE=0
-        timeout 600 bash -c '
-            journalctl --user -u okawhisp.service \
-                --since "'"$START_TIME"'" -f -o cat 2>/dev/null | \
-            grep --line-buffered -vE \
-                "^(Stopping|Stopped|Started|Failed|okawhisp\.service:)|={5,}|OkaWhisp (beendet|gestartet|- System)|Log-Datei:|Progress may not|^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | \
-            while IFS= read -r line; do
-                [ -n "$line" ] && printf "  %s\n" "$line"
-                if printf "%s\n" "$line" | grep -qiE "(Starte Hotkey|🎹|Hotkey listener|bereit|ready|listening)"; then
-                    exit 0
-                fi
-            done
-        ' || EXIT_CODE=$?
+        ( journalctl --user -u okawhisp.service \
+              --since "$START_TIME" -f -o cat 2>/dev/null | \
+          grep --line-buffered -vE \
+              "^(Stopping|Stopped|Started|Failed|okawhisp\.service:)|={5,}|OkaWhisp (beendet|gestartet|- System)|Log-Datei:|Progress may not|^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | \
+          while IFS= read -r line; do
+              [ -n "$line" ] && printf "  %s\n" "$line"
+          done ) &
+        STREAM_PID=$!
 
+        MAX_WAIT=600
+        WAITED=0
+        READY=0
+        while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+            if ! systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
+                break
+            fi
+            if journalctl --user -u okawhisp.service \
+                    --since "$START_TIME" --no-pager -o cat 2>/dev/null | \
+               grep -qiE "(Starte Hotkey|🎹|Hotkey listener|PyAudio|Input-Stream)"; then
+                READY=1
+                break
+            fi
+            sleep 2
+            WAITED=$((WAITED + 2))
+        done
+
+        kill "$STREAM_PID" 2>/dev/null
+        wait "$STREAM_PID" 2>/dev/null
         echo ""
-        case "$EXIT_CODE" in
-            0)   ok "Service ready! Press F9 to record." ;;
-            124) warn "Timeout after 10 min. Check: journalctl --user -u okawhisp -f" ;;
-            *)   warn "Service stopped. Check: journalctl --user -u okawhisp -f" ;;
-        esac
+
+        if [ "$READY" -eq 1 ]; then
+            ok "Service ready! Press F9 to record."
+        elif ! systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
+            warn "Service stopped. Check: journalctl --user -u okawhisp -f"
+        else
+            warn "Timeout. Check: journalctl --user -u okawhisp -f"
+        fi
     fi
 
 elif [ "$PLATFORM" = "macos" ]; then
