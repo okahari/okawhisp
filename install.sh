@@ -184,7 +184,7 @@ StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${SCRIPT} --key F9 --model ${WHISPER_MODEL:-small} --engine faster --language de --beam-size 5 --silence 2.0
+ExecStart=/usr/bin/python3 $SCRIPT --key F9 --model $WHISPER_MODEL --engine faster --language de --beam-size 5 --silence 2.0
 
 Environment="DISPLAY=${DISPLAY_VAL}"
 Environment="XAUTHORITY=${XAUTH_VAL}"
