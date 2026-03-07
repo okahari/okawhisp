@@ -114,7 +114,7 @@ VAD_CHUNK_SAMPLES  = 512    # silero benötigt exakt 512 Samples bei 16kHz (32ms
 # Audio-Ducking: Andere Apps während Aufnahme leiser stellen
 # Sink-Input-Ducking (andere Apps) + Sink-Volume-Reduktion als Catch-All
 DUCK_AUDIO_DURING_RECORDING = True
-DUCK_SINK_LEVEL = 10        # % auf den alle Sinks reduziert werden (Catch-All für Musik etc.)
+DUCK_SINK_LEVEL = 5         # % auf den alle Sinks reduziert werden (Catch-All für Musik etc.)
 
 # Benutzerdefinierte Sounds (werden bevorzugt abgespielt, falls vorhanden)
 # Sounds: automatisch aus ~/.local/share/okawhisp/sounds/ laden (vom Installer)
@@ -411,22 +411,29 @@ def _play_pcm_sound(samples, sample_rate=44100):
         return False
 
 
-def _play_audio_file(file_path):
-    """Spielt eine Audio-Datei asynchron ab (ffplay bevorzugt, paplay fallback)."""
+def _play_audio_file(file_path, volume_boost: float = 1.0):
+    """Spielt eine Audio-Datei asynchron ab (ffplay bevorzugt, paplay fallback).
+    
+    Args:
+        file_path: Pfad zur Audio-Datei
+        volume_boost: Lautstärke-Multiplikator (1.0 = normal, 2.0 = doppelt so laut)
+    """
     if not file_path or not os.path.isfile(file_path):
         return False
 
     # ffplay kann MP3/WAV zuverlässig ohne GUI abspielen.
     try:
-        subprocess.Popen(
-            ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', file_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']
+        if volume_boost != 1.0:
+            # Volume-Filter für Lautstärke-Anpassung
+            cmd.extend(['-af', f'volume={volume_boost}'])
+        cmd.append(file_path)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except FileNotFoundError:
         pass
 
-    # Fallback (funktioniert gut bei WAV/OGA).
+    # Fallback (funktioniert gut bei WAV/OGA, unterstützt kein Volume-Boost).
     try:
         subprocess.Popen(
             ['paplay', file_path],
@@ -491,18 +498,23 @@ def _soft_end_buzzer_sound(sample_rate=44100):
     return (signal * envelope * 0.30).astype(np.float32)
 
 
-def play_sound(sound_name):
-    """Feedback-Sound abspielen."""
+def play_sound(sound_name, volume_boost: float = 1.0):
+    """Feedback-Sound abspielen.
+    
+    Args:
+        sound_name: Name des Sounds (record_start, record_end)
+        volume_boost: Lautstärke-Multiplikator (für Sounds während Ducking)
+    """
     custom_file_map = {
         "record_start": CUSTOM_RECORD_START_SOUND,
         "record_end": CUSTOM_RECORD_END_SOUND,
     }
 
     # 1) Benutzerdateien haben Vorrang.
-    if _play_audio_file(custom_file_map.get(sound_name)):
+    if _play_audio_file(custom_file_map.get(sound_name), volume_boost=volume_boost):
         return
 
-    # 2) Synthetische Sounds als Fallback.
+    # 2) Synthetische Sounds als Fallback (kein Volume-Boost möglich).
     custom_sounds = {
         "record_start": _switch_click_sound,
         "record_end": _soft_end_buzzer_sound,
@@ -641,6 +653,14 @@ def duck_audio() -> dict:
     if not sinks:
         log.debug("  [duck] Keine Sinks gefunden")
         return {}
+    _duck_with_state(sinks)
+    return sinks
+
+
+def _duck_with_state(sinks: dict):
+    """Interner Duck mit bereits erfassten Sink-Volumes."""
+    if not sinks:
+        return
     try:
         step_delay = DUCK_FADE_DURATION / DUCK_FADE_STEPS
         for step in range(DUCK_FADE_STEPS, 0, -1):
@@ -654,10 +674,9 @@ def duck_audio() -> dict:
         for sid in sinks:
             subprocess.run(["pactl", "set-sink-volume", sid, f"{DUCK_SINK_LEVEL}%"],
                            capture_output=True, timeout=2)
-        log.debug(f"  [duck] Sinks auf {DUCK_SINK_LEVEL}% gefadet: {sinks}")
+        log.debug(f"  [duck] Sinks auf {DUCK_SINK_LEVEL}% gefadet")
     except Exception as e:
         log.warning(f"  [duck] Audio-Ducking fehlgeschlagen: {e}")
-    return sinks
 
 
 def unduck_audio(state: dict):
@@ -943,44 +962,44 @@ def _run_voice_input():
             notify("❌ Audio-Fehler", f"Mic nicht bereit: {e}", "critical")
             return
 
-    # ── 2b. Duck (blockierend) ───────────────────────────────────
-    # Erst Musik runter, dann Start-Sound als GO-Signal.
+    # ── 2b. Original-Volumes erfassen (VOR allem anderen!) ────────
+    # Wichtig: Volumes ZUERST speichern, bevor irgendwas abgespielt wird.
     _ducked_sinks = {}
     if DUCK_AUDIO_DURING_RECORDING:
-        log.info(f"  [2b] 🔇 Duck: Sinks → {DUCK_SINK_LEVEL}% (1s Fade)")
-        _ducked_sinks = duck_audio()
+        _ducked_sinks = _get_all_sinks()
+        log.info(f"  [2b] 📊 Original-Volumes erfasst: {_ducked_sinks}")
 
-    # ── 2c. Kalibrierung (nur RMS-Fallback) ──────────────────────
+    # ── 2c. Duck ZUERST (blockierend) ────────────────────────────
+    # Musik runterfahren BEVOR der Start-Sound kommt → sauberer Übergang
+    if DUCK_AUDIO_DURING_RECORDING and _ducked_sinks:
+        log.info(f"  [2c] 🔇 Duck: Sinks → {DUCK_SINK_LEVEL}% (1s Fade)")
+        _duck_with_state(_ducked_sinks)
+
+    # ── 2d. Start-Sound NACH Duck ────────────────────────────────
+    # Sound mit Volume-Boost abspielen um die Sink-Reduktion auszugleichen.
+    # Bei 5% Ducking: theoretisch 20x nötig, aber 4-5x reicht praktisch
+    # (der Sound muss nicht gleich laut sein wie vorher die Musik, nur gut hörbar).
+    # Max 5x um Clipping zu vermeiden.
+    volume_boost = min(5.0, 100.0 / DUCK_SINK_LEVEL) if (DUCK_AUDIO_DURING_RECORDING and _ducked_sinks) else 1.0
+    log.info(f"  [2d] 🔔 Start-Sound (GO-Signal, volume_boost={volume_boost:.1f}x)")
+    play_sound("record_start", volume_boost=volume_boost)
+    notify("🔴 Aufnahme", "Sprich jetzt…")
+    time.sleep(0.4)   # Sound fertig abspielen lassen
+
+    # ── 2e. Kalibrierung (nur RMS-Fallback) ──────────────────────
     use_vad = VAD_ENABLED and _vad_model is not None
     if not use_vad:
         dynamic_threshold = calibrate_silence_threshold(_audio_stream)
-        log.info(f"  [2c] RMS-Fallback: threshold={dynamic_threshold}")
+        log.info(f"  [2e] RMS-Fallback: threshold={dynamic_threshold}")
     else:
         dynamic_threshold = None
 
-    # ── 3. Start-Sound als GO-Signal ────────────────────────────
-    # Musik ist auf DUCK_SINK_LEVEL% — kurze Pause damit Fade
-    # hörbar endet, dann auf 80% anheben für klaren Start-Sound.
-    time.sleep(0.5)
-    if DUCK_AUDIO_DURING_RECORDING and _ducked_sinks:
-        for sid in _ducked_sinks:
-            subprocess.run(["pactl", "set-sink-volume", sid, "80%"],
-                           capture_output=True, timeout=2)
-    log.info("  [3] 🔔 Start-Sound (GO-Signal)")
-    play_sound("record_start")
-    notify("🔴 Aufnahme", "Sprich jetzt…")
-    time.sleep(0.35)   # Sound fertig abgespielen lassen
-    if DUCK_AUDIO_DURING_RECORDING and _ducked_sinks:
-        for sid in _ducked_sinks:
-            subprocess.run(["pactl", "set-sink-volume", sid, f"{DUCK_SINK_LEVEL}%"],
-                           capture_output=True, timeout=2)
-
     if use_vad:
         log.info(f"  [3] 🔴 Aufnahme läuft (VAD, threshold={VAD_THRESHOLD}, "
-                 f"min_silence={VAD_MIN_SILENCE_MS}ms)")
+                 f"min_silence={VAD_MIN_SILENCE_MS}ms, duck={DUCK_SINK_LEVEL}%)")
     else:
         log.info(f"  [3] 🔴 Aufnahme läuft (RMS, Stille-Limit={SILENCE_DURATION}s, "
-                 f"Threshold={dynamic_threshold})")
+                 f"Threshold={dynamic_threshold}, duck={DUCK_SINK_LEVEL}%)")
 
     # ── 4. Aufnahme ─────────────────────────────────────────────
     record_start_ts = time.time()
@@ -1001,20 +1020,19 @@ def _run_voice_input():
         except Exception as ex:
             log.warning(f"  [4] stop_stream() Fehler: {ex}")
 
-    # ── 5. Stop-Sound (VOR Unduck) ───────────────────────────────
-    # Erst Stop-Sound bei DUCK_SINK_LEVEL%, kurz auf 80% anheben.
+    # ── 5. Audio-Unduck ────────────────────────────────────────────
+    # Erst Musik zurück auf Original-Lautstärke fahren...
     if DUCK_AUDIO_DURING_RECORDING and _ducked_sinks:
-        for sid in _ducked_sinks:
-            subprocess.run(["pactl", "set-sink-volume", sid, "80%"],
-                           capture_output=True, timeout=2)
-    log.info("  [5] 🔔 Stop-Sound")
-    play_sound("record_end")
-    time.sleep(0.5)   # kurze Pause, dann erst Musik hochfahren
-
-    # ── 5b. Audio-Unduck ─────────────────────────────────────────
-    if DUCK_AUDIO_DURING_RECORDING and _ducked_sinks:
-        log.info("  [5b] 🔊 Unduck: Musik fährt wieder hoch")
+        log.info("  [5] 🔊 Unduck: Musik fährt wieder hoch")
         unduck_audio(_ducked_sinks)
+        # Kurze Pause für PulseAudio/PipeWire Sync bevor Sound abgespielt wird
+        time.sleep(0.15)
+
+    # ── 5b. Stop-Sound (NACH Unduck) ─────────────────────────────
+    # Stop-Sound bei voller Original-Lautstärke abspielen (Volumes sind wiederhergestellt).
+    log.info("  [5b] 🔔 Stop-Sound (volle Lautstärke)")
+    play_sound("record_end")
+    time.sleep(0.3)   # kurze Pause nach Sound
 
     if not frames:
         log.warning("  [5] Keine Audio-Frames aufgenommen")
