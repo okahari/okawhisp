@@ -1,22 +1,27 @@
-# okawhisp
+# OkaWhisp 🎙️
 
-**Fast local speech-to-text (STT) for Linux.** Press a hotkey to start speaking. Recording stops automatically when silence is detected, and your words are typed into any focused window — terminal, editor, chat, browser, anything.
+**Local voice typing for Linux** — speak and your words appear anywhere.
 
-You can also use a hold-to-talk flow: hold the key while speaking and send the transcription automatically on release/silence (depending on your configuration).
+> Speech-to-text powered by Whisper. Push-to-talk or toggle mode. Fully offline, privacy-first.
 
-Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, 4x faster than OpenAI Whisper) and [silero-vad](https://github.com/snakers4/silero-vad) for ML-based silence detection. Fully local, no cloud, runs on your GPU or CPU.
+Press a hotkey → speak → text is typed into any focused window (terminal, browser, chat, editor — anything).
+
+- **Push-to-Talk (PTT)**: Hold the key while speaking, release to transcribe & send
+- **Toggle mode**: Tap to start recording, silence auto-stops
+
+Built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (4× faster than OpenAI Whisper) and [silero-vad](https://github.com/snakers4/silero-vad) for ML-based voice activity detection. Runs **100% locally** on your GPU or CPU — no cloud, no API keys, no data leaves your machine.
 
 ---
 
 ## Features
 
-- **Global hotkey** (**AltGr** by default) — works in any window
-- **Configurable hotkey** — supports AltGr plus F1–F12 via config/CLI
-- **One-key flow** — press the hotkey to start recording; speech end/silence triggers automatic stop + send
-- **Auto-stop** via Voice Activity Detection (silero-vad) — stops when you stop talking
-- **Audio ducking** — background audio fades during recording and is restored afterward
-- **GPU-accelerated** transcription (CUDA) with CPU fallback
-- **Systemd service** — runs in the background, auto-restarts on crash
+- 🎹 **Global hotkey** (AltGr default, F1–F12 configurable) — works in any window
+- 🎤 **Push-to-Talk + Toggle mode** — hold to talk or tap to start/stop
+- 🤫 **Smart auto-stop** via Voice Activity Detection (silero-vad)
+- 🔇 **Audio ducking** — background music fades during recording
+- ⚡ **GPU-accelerated** (CUDA) with CPU fallback
+- 🔄 **Systemd service** — runs in background, auto-restarts on crash
+- 🔒 **Offline & private** — no internet required after model download
 
 ---
 
@@ -40,9 +45,7 @@ language = "de"
 engine = "faster"
 beam_size = 5
 silence = 2.5
-# Optional hint words for domain terms/names.
-# Default is empty (no prompt).
-prompt = ""         # Example: "PostgreSQL, Supabase, Tailwind"
+prompt = ""         # Optional: "PostgreSQL, Kubernetes, Tailwind"
 
 [vad]
 enabled = true
@@ -53,39 +56,31 @@ min_silence_ms = 2500
 enabled = true
 ```
 
-`prompt` is optional. Leave it empty unless you regularly dictate specific names, product terms, or uncommon words.
-
 ---
 
-## Model Comparison
+## Models
 
-| Model | Download | VRAM | Quality | Speed (GPU) |
-|-------|----------|------|---------|-------------|
-| tiny | 75 MB | 1 GB | Good | Very Fast |
-| base | 145 MB | 2 GB | Better | Fast |
-| small | 470 MB | 4 GB | High | Medium |
-| medium | 1.5 GB | 6 GB | Very High | Slower |
-| large-v3 | 3 GB | 8 GB | Best | Slower |
+| Model | Size | VRAM | Quality | Speed |
+|-------|------|------|---------|-------|
+| tiny | 75 MB | 1 GB | Good | ⚡⚡⚡ |
+| base | 145 MB | 2 GB | Better | ⚡⚡ |
+| small | 470 MB | 4 GB | High | ⚡ |
+| medium | 1.5 GB | 6 GB | Very High | 🐢 |
+| large-v3 | 3 GB | 8 GB | Best | 🐢 |
 
-CPU inference is supported (int8 quantization). Use `tiny` or `base` for CPU-only systems.
+CPU inference supported (int8). Use `tiny` or `base` for CPU-only systems.
 
 ---
 
 ## Usage
 
-Service runs automatically after install. Press **AltGr** to record.
-
-Logs:
+Service starts automatically. Press **AltGr** (or your configured key) to record.
 
 ```bash
+# View logs
 journalctl --user -u okawhisp.service -f
-# or
-tail -f ~/.local/share/okawhisp/okawhisp.log
-```
 
-Restart service:
-
-```bash
+# Restart
 systemctl --user restart okawhisp.service
 ```
 
@@ -93,29 +88,18 @@ systemctl --user restart okawhisp.service
 
 ## Troubleshooting
 
-**No audio input:**
-
-```bash
-pactl list sources short
-```
-
-**Bluetooth mic issues:**
-
-```bash
-systemctl --user restart okawhisp.service
-```
-
-**Text not appearing:**
-Check xdotool: `xdotool getactivewindow`
-
-**GPU not detected:**
-
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
+| Problem | Check |
+|---------|-------|
+| No audio | `pactl list sources short` |
+| Text not typed | `xdotool getactivewindow` |
+| No GPU | `python -c "import torch; print(torch.cuda.is_available())"` |
 
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+---
+
+<sub>**Keywords:** voice typing linux, speech to text, whisper, faster-whisper, STT, voice input, dictation, push to talk, PTT, voice recognition, transcription, offline speech recognition, local AI, silero-vad, voice activity detection</sub>
