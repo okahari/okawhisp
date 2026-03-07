@@ -227,6 +227,11 @@ case "$WHISPER_MODEL" in
     medium)   ESTIMATED_SEC=120; MODEL_MB=1500 ;;
     large-v3) ESTIMATED_SEC=240; MODEL_MB=3000 ;;
     *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
+esac
+
+info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
+echo ""
+
 MAX_WAIT=600  # 10 minutes
 WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
