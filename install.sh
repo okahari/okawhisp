@@ -265,7 +265,7 @@ ok "Model ready"
 
 # ── 7. Install and start service ─────────────────────────────────────────────
 echo ""
-info "Installing service..."
+info "Installing user service (systemctl --user)..."
 
 DISPLAY_VAL="${DISPLAY:-:0}"
 XAUTH_VAL="${XAUTHORITY:-$HOME/.Xauthority}"
@@ -316,17 +316,15 @@ EOF
         START_TIME="$(date +'%Y-%m-%d %H:%M:%S')"
 
         if systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
-            info "Restarting service with new config..."
             systemctl --user restart okawhisp.service
         else
-            info "Starting service..."
             systemctl --user start okawhisp.service
         fi
 
         # Display: stream filtered journal output in background (visual only)
         # Detection: poll journal snapshots in foreground (avoids journalctl -f deadlock)
         echo ""
-        info "Starting service..."
+        info "Waiting for model to load..."
         echo ""
 
         ( journalctl --user -u okawhisp.service \
@@ -414,7 +412,9 @@ echo "  Press F9 to start recording."
 echo ""
 if [ "$PLATFORM" = "linux" ] && command -v systemctl &>/dev/null; then
     echo "  Logs:    journalctl --user -u okawhisp -f"
+    echo "  Status:  systemctl --user status okawhisp"
     echo "  Restart: systemctl --user restart okawhisp"
+    echo "  Note:    always use --user (it is a user service, not system-level)"
 elif [ "$PLATFORM" = "macos" ]; then
     echo "  Logs:    tail -f ${INSTALL_DIR}/okawhisp.log"
     echo "  Restart: launchctl unload ${PLIST_FILE} && launchctl load ${PLIST_FILE}"
