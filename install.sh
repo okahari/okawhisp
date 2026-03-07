@@ -121,15 +121,15 @@ if command -v nvidia-smi &>/dev/null; then
     fi
 fi
 
-# Recommend model based on VRAM (default to small for fast install)
+# Recommend model based on VRAM (auto-detection)
 if [ $VRAM_GB -ge 8 ]; then
-    RECOMMENDED="medium"
+    RECOMMENDED="large"
     REASON="(8+ GB VRAM - best quality)"
 elif [ $VRAM_GB -ge 6 ]; then
-    RECOMMENDED="small"
-    REASON="(6-8 GB VRAM - good quality)"
+    RECOMMENDED="medium"
+    REASON="(6-8 GB VRAM - high quality)"
 elif [ $VRAM_GB -ge 4 ]; then
-    RECOMMENDED="large"
+    RECOMMENDED="small"
     REASON="(4-6 GB VRAM - good quality)"
 elif [ $VRAM_GB -ge 2 ]; then
     RECOMMENDED="base"
