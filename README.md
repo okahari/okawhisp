@@ -55,13 +55,13 @@ DUCK_AUDIO_DURING_RECORDING=True  # Fade background audio
 
 ## Model Comparison
 
-| Model | Size | VRAM | Quality | Speed (GPU) |
-|-------|------|------|---------|-------------|
-| tiny | 39 MB | 1 GB | Good | Very Fast |
-| base | 74 MB | 2 GB | Better | Fast |
-| small | 244 MB | 4 GB | High | Medium |
-| medium | 769 MB | 6 GB | Very High | Slower |
-| large-v3 | 1.5 GB | 8 GB | Best | Slower |
+| Model | Download | VRAM | Quality | Speed (GPU) |
+|-------|----------|------|---------|-------------|
+| tiny | 75 MB | 1 GB | Good | Very Fast |
+| base | 145 MB | 2 GB | Better | Fast |
+| small | 470 MB | 4 GB | High | Medium |
+| medium | 1.5 GB | 6 GB | Very High | Slower |
+| large-v3 | 3 GB | 8 GB | Best | Slower |
 
 CPU inference supported (int8 quantization). Use `tiny` or `base` for CPU-only systems.
 
