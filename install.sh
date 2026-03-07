@@ -209,11 +209,39 @@ systemctl --user enable okawhisp.service
 
 # Force restart to apply new config (even if already running)
 if systemctl --user is-active --quiet okawhisp.service; then
+    info "Restarting service with new model config..."
     systemctl --user restart okawhisp.service
 else
+    info "Starting service..."
     systemctl --user start okawhisp.service
 fi
-ok "Service installed and started"
+
+# Wait for service to be ready (model loaded)
+info "Waiting for model download and service initialization..."
+echo "     This may take 1-5 minutes depending on model size."
+echo ""
+
+MAX_WAIT=300  # 5 minutes
+WAITED=0
+while [ $WAITED -lt $MAX_WAIT ]; do
+    # Check if service is ready (hotkey listener started)
+    if journalctl --user -u okawhisp.service --since "30 seconds ago" 2>/dev/null | grep -q "Hotkey-Listener"; then
+        ok "Service ready!"
+        break
+    fi
+    
+    # Show progress every 10 seconds
+    if [ $((WAITED % 10)) -eq 0 ] && [ $WAITED -gt 0 ]; then
+        echo -n "."
+    fi
+    
+    sleep 2
+    WAITED=$((WAITED + 2))
+done
+
+if [ $WAITED -ge $MAX_WAIT ]; then
+    err "Service did not start in time. Check logs: journalctl --user -u okawhisp -f"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
