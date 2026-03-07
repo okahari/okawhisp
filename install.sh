@@ -208,15 +208,6 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable okawhisp.service
 
-# Force restart to apply new config (even if already running)
-if systemctl --user is-active --quiet okawhisp.service; then
-    info "Restarting service with new model config..."
-    systemctl --user restart okawhisp.service
-else
-    info "Starting service..."
-    systemctl --user start okawhisp.service
-fi
-
 # ── 6. Download Whisper model BEFORE starting service ────────────────────────
 echo ""
 info "Downloading Whisper model '${WHISPER_MODEL}'..."
@@ -256,7 +247,17 @@ fi
 
 ok "Model downloaded"
 
-# ── 7. Wait for service to be ready ───────────────────────────────────────────
+# ── 7. Start service NOW (model is in cache) ─────────────────────────────────
+# Force restart to apply new config (even if already running)
+if systemctl --user is-active --quiet okawhisp.service; then
+    info "Restarting service with new model..."
+    systemctl --user restart okawhisp.service
+else
+    info "Starting service..."
+    systemctl --user start okawhisp.service
+fi
+
+# ── 8. Wait for service to be ready ───────────────────────────────────────────
 echo ""
 info "Starting service (model will load from cache)..."
 
