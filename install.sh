@@ -107,23 +107,63 @@ check_and_install "pynput"
 echo ""
 ok "Python dependencies ready"
 
-# ── 5. Model selection ────────────────────────────────────────────────────────
+# ── 5. Model selection (GPU-aware) ───────────────────────────────────────────
+echo ""
+info "Detecting GPU capabilities..."
+
+# Detect VRAM
+VRAM_GB=0
+if command -v nvidia-smi &>/dev/null; then
+    VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [ -n "$VRAM_MB" ]; then
+        VRAM_GB=$((VRAM_MB / 1024))
+        echo "  GPU found: ${VRAM_GB} GB VRAM"
+    fi
+fi
+
+# Recommend model based on VRAM
+if [ $VRAM_GB -ge 8 ]; then
+    RECOMMENDED="large"
+    REASON="(8+ GB VRAM - best quality)"
+elif [ $VRAM_GB -ge 6 ]; then
+    RECOMMENDED="medium"
+    REASON="(6-8 GB VRAM - high quality)"
+elif [ $VRAM_GB -ge 4 ]; then
+    RECOMMENDED="small"
+    REASON="(4-6 GB VRAM - good quality)"
+elif [ $VRAM_GB -ge 2 ]; then
+    RECOMMENDED="base"
+    REASON="(2-4 GB VRAM - decent quality)"
+else
+    RECOMMENDED="tiny"
+    REASON="(CPU or low VRAM - fast)"
+fi
+
 echo ""
 info "Whisper model selection:"
 echo ""
-echo "  small  - 244 MB download, fast, good quality (recommended)"
-echo "  large  - 2.9 GB download, best quality, slower first start"
+echo "  tiny   - 39 MB, very fast, decent quality"
+echo "  base   - 74 MB, fast, good quality"
+echo "  small  - 244 MB, balanced, good quality"
+echo "  medium - 769 MB, slower, high quality"
+echo "  large  - 2.9 GB, slowest, best quality"
 echo ""
-read -p "Choose model [small]: " MODEL_CHOICE
-MODEL_CHOICE=${MODEL_CHOICE:-small}
+echo "  Recommended for your system: ${RECOMMENDED} ${REASON}"
+echo ""
+read -p "Choose model [${RECOMMENDED}]: " MODEL_CHOICE
+MODEL_CHOICE=${MODEL_CHOICE:-$RECOMMENDED}
 
-if [ "$MODEL_CHOICE" = "large" ]; then
-    WHISPER_MODEL="large-v3"
-    info "Selected: large-v3 (first start will download ~2.9 GB, be patient!)"
-else
-    WHISPER_MODEL="small"
-    info "Selected: small (fast download)"
-fi
+# Map to actual model names
+case "$MODEL_CHOICE" in
+    tiny)   WHISPER_MODEL="tiny" ;;
+    base)   WHISPER_MODEL="base" ;;
+    small)  WHISPER_MODEL="small" ;;
+    medium) WHISPER_MODEL="medium" ;;
+    large)  WHISPER_MODEL="large-v3" ;;
+    *)      WHISPER_MODEL="$RECOMMENDED" ;;
+esac
+
+info "Selected: ${WHISPER_MODEL}"
 
 # ── 6. Systemd service ────────────────────────────────────────────────────────
 info "Installing systemd service..."
