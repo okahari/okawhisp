@@ -103,6 +103,7 @@ check_and_install "pyaudio"
 check_and_install "faster-whisper" "faster_whisper"
 check_and_install "silero-vad" "silero_vad"
 check_and_install "pynput"
+check_and_install "huggingface-hub" "huggingface_hub"
 
 echo ""
 ok "Python dependencies ready"
