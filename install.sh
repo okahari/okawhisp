@@ -30,7 +30,6 @@ done
 
 if [ ${#MISSING[@]} -gt 0 ]; then
     info "Installing missing system packages: ${MISSING[*]}"
-    # Map commands to packages
     declare -A PKG_MAP=(
         [xdotool]="xdotool"
         [pactl]="pipewire-audio"
@@ -46,6 +45,7 @@ fi
 ok "System dependencies OK"
 
 # ── 2. pip ────────────────────────────────────────────────────────────────────
+info "Checking pip..."
 if ! python3 -m pip --version &>/dev/null; then
     info "Installing pip..."
     sudo apt-get install -y python3-pip 2>/dev/null \
@@ -67,32 +67,44 @@ curl -sSL "$REPO/sounds/stop.mp3" -o "$INSTALL_DIR/sounds/stop.mp3"
 ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
 ok "Script installed to $INSTALL_DIR"
 
-# ── 4. Check Python dependencies ──────────────────────────────────────────────
+# ── 4. Python dependencies ────────────────────────────────────────────────────
+echo ""
 info "Checking Python dependencies..."
-MISSING_PY=()
+echo ""
 
-python3 -c "import torch" 2>/dev/null || MISSING_PY+=("torch")
-python3 -c "import faster_whisper" 2>/dev/null || MISSING_PY+=("faster-whisper")
-python3 -c "import numpy" 2>/dev/null || MISSING_PY+=("numpy")
-python3 -c "import pyaudio" 2>/dev/null || MISSING_PY+=("pyaudio")
-python3 -c "import pynput" 2>/dev/null || MISSING_PY+=("pynput")
-
-python3 -c "import silero_vad" 2>/dev/null || MISSING_PY+=("silero-vad")
-
-if [ ${#MISSING_PY[@]} -eq 0 ]; then
-    ok "All Python dependencies already installed"
-else
-    info "Installing missing Python packages: ${MISSING_PY[*]}"
-    info "This may take 1-5 min on first install (torch+CUDA ~2GB)"
+check_and_install() {
+    local pkg=$1
+    local import_name=${2:-$pkg}
     
-    # Install via pip --user (uses system site-packages, no isolated env)
-    for pkg in "${MISSING_PY[@]}"; do
-        if ! python3 -m pip install --user --break-system-packages "$pkg" >/dev/null 2>&1; then
-            err "Failed to install $pkg. Aborting."
+    echo -n "  Checking $pkg... "
+    if python3 -c "import $import_name" 2>/dev/null; then
+        echo -e "${GREEN}installed${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}missing${NC}"
+        echo -n "  Installing $pkg... "
+        if python3 -m pip install --user --break-system-packages "$pkg" >/dev/null 2>&1; then
+            echo -e "${GREEN}OK${NC}"
+            return 0
+        else
+            echo -e "${RED}FAILED${NC}"
+            echo ""
+            echo "  Trying to install $pkg with verbose output:"
+            python3 -m pip install --user --break-system-packages "$pkg"
+            return $?
         fi
-    done
-    ok "Python dependencies installed"
-fi
+    fi
+}
+
+check_and_install "torch"
+check_and_install "numpy"
+check_and_install "pyaudio"
+check_and_install "faster-whisper" "faster_whisper"
+check_and_install "silero-vad" "silero_vad"
+check_and_install "pynput"
+
+echo ""
+ok "Python dependencies ready"
 
 # ── 5. Systemd service ────────────────────────────────────────────────────────
 info "Installing systemd service..."
