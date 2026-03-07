@@ -1,15 +1,6 @@
-#!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#   "pyaudio",
-#   "numpy",
-#   "faster-whisper",
-#   "silero-vad>=6.0",
-#   "torch",
-#   "pynput",
-# ]
-# ///
+#!/usr/bin/env python3
+# Requirements: pyaudio, numpy, faster-whisper, silero-vad>=6.0, torch, pynput
+# Install via: python3 -m pip install --user pyaudio numpy faster-whisper silero-vad torch pynput
 """
 OkaWhisp - System-Level Voice-to-Text für jedes Fenster
 ========================================================
