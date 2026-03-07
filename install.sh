@@ -232,40 +232,47 @@ esac
 info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
 echo ""
 
-# Wait up to 10 minutes for model download + loading
-MAX_WAIT=600
+MAX_WAIT=600  # 10 minutes (for slow connections or large models)
 WAITED=0
-
-echo "  This may take several minutes depending on your connection and GPU..."
-echo ""
+SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 while [ $WAITED -lt $MAX_WAIT ]; do
-    # Check if service is ready (look for hotkey messages in recent logs)
-    if journalctl --user -u okawhisp.service --since "5 minutes ago" --no-pager 2>/dev/null | grep -qE "(Starte Hotkey-Listener|🎹 Hotkey: F9)"; then
+    # Check if service is ready (hotkey listener started)
+    if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -qE "(Starte Hotkey|🎹 Hotkey)"; then
+        # Clear line and show completion
+        echo -ne "\r\033[K"
+        echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100% ✓ Model loaded!"
+        echo ""
         ok "Service ready!"
         break
     fi
     
-    # Check if service crashed
-    if systemctl --user is-failed --quiet okawhisp.service 2>/dev/null; then
-        echo ""
-        err "Service failed to start. Check logs: journalctl --user -u okawhisp -n 50"
+    # Calculate progress (estimate)
+    if [ $WAITED -lt $ESTIMATED_SEC ]; then
+        PROGRESS=$((WAITED * 100 / ESTIMATED_SEC))
+    else
+        PROGRESS=$((95 + (WAITED - ESTIMATED_SEC) * 5 / 60))
+        [ $PROGRESS -gt 99 ] && PROGRESS=99
     fi
     
-    # Simple progress dots
-    echo -n "."
-    sleep 5
-    WAITED=$((WAITED + 5))
+    # Draw progress bar
+    FILLED=$((PROGRESS / 5))
+    EMPTY=$((20 - FILLED))
+    BAR=$(printf "${GREEN}▓%.0s${NC}" $(seq 1 $FILLED))$(printf "░%.0s" $(seq 1 $EMPTY))
+    
+    # Spinner animation
+    SPIN_IDX=$((WAITED % 10))
+    SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
+    
+    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%"
+    
+    sleep 2
+    WAITED=$((WAITED + 2))
 done
 
-echo ""
-
 if [ $WAITED -ge $MAX_WAIT ]; then
-    warn "Service did not become ready within ${MAX_WAIT}s"
-    warn "It may still be downloading the model in the background"
-    warn "Check status: journalctl --user -u okawhisp -f"
-else
     echo ""
+    err "Service did not start in time. Check logs: journalctl --user -u okawhisp -f"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
