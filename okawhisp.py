@@ -126,8 +126,10 @@ DUCK_AUDIO_DURING_RECORDING = True
 DUCK_SINK_LEVEL = 10        # % auf den alle Sinks reduziert werden (Catch-All für Musik etc.)
 
 # Benutzerdefinierte Sounds (werden bevorzugt abgespielt, falls vorhanden)
-CUSTOM_RECORD_START_SOUND = "/home/okahari/Musik/sounds/freesound_community-light-switch-81967.mp3"
-CUSTOM_RECORD_END_SOUND = "/home/okahari/Musik/sounds/peggy_marco-screenshot-iphone-sound-336170.mp3"
+# Sounds: automatisch aus ~/.local/share/okawhisp/sounds/ laden (vom Installer)
+_SOUND_DIR = Path.home() / ".local" / "share" / "okawhisp" / "sounds"
+CUSTOM_RECORD_START_SOUND = str(_SOUND_DIR / "start.mp3") if (_SOUND_DIR / "start.mp3").exists() else None
+CUSTOM_RECORD_END_SOUND = str(_SOUND_DIR / "stop.mp3") if (_SOUND_DIR / "stop.mp3").exists() else None
 
 # ── OpenAI-kompatible API (engine=api) ───────────────────────────
 # Funktioniert mit: OpenAI, Groq, lokaler whisper.cpp-Server, u.a.

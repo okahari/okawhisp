@@ -57,13 +57,17 @@ ok "uv ready: $UV"
 
 # ── 3. Download script ────────────────────────────────────────────────────────
 info "Installing okawhisp script..."
-mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$INSTALL_DIR/sounds"
 curl -sSL "$REPO/okawhisp.py" -o "$SCRIPT"
 chmod +x "$SCRIPT"
 
+# Download sound files
+curl -sSL "$REPO/sounds/start.mp3" -o "$INSTALL_DIR/sounds/start.mp3"
+curl -sSL "$REPO/sounds/stop.mp3" -o "$INSTALL_DIR/sounds/stop.mp3"
+
 # Convenience symlink
 ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
-ok "Script installed to $SCRIPT"
+ok "Script installed to $INSTALL_DIR"
 
 # ── 4. Pre-warm dependencies (runs in background, first launch may be slow otherwise) ──
 info "Pre-installing Python dependencies (this takes ~30s on first run)..."

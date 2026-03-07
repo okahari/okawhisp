@@ -1,13 +1,15 @@
 [Unit]
 Description=OkaWhisp - System-Level Voice Input (F9 Hotkey)
-Documentation=file:///home/okahari/workspace/okawhisp/README.md
+Documentation=https://github.com/YOUR_USER/okawhisp
 After=graphical-session.target pipewire.service
 StartLimitBurst=3
 StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=/home/okahari/.local/bin/uv run /home/okahari/workspace/okawhisp/okawhisp.py --key F9 --model large-v3 --engine faster --language de --beam-size 5 --silence 2.0
+# NOTE: This is a template for local dev.
+# The installer (install.sh) generates the actual service file with correct paths.
+ExecStart=/usr/bin/env bash -c 'uv run ~/.local/share/okawhisp/okawhisp.py --key F9 --model large-v3 --engine faster --language de'
 
 # X11 + Audio Zugriff
 Environment="DISPLAY=:1"
