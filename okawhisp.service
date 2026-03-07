@@ -1,6 +1,6 @@
 [Unit]
 Description=OkaWhisp - System-Level Voice Input (F9 Hotkey)
-Documentation=https://github.com/YOUR_USER/okawhisp
+Documentation=https://github.com/okahari/okawhisp
 After=graphical-session.target pipewire.service
 StartLimitBurst=3
 StartLimitIntervalSec=60s

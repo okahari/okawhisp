@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # okawhisp installer
-# Usage: curl -sSL https://raw.githubusercontent.com/YOUR_USER/okawhisp/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/okahari/okawhisp/main/install.sh | bash
 set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/YOUR_USER/okawhisp/main"
+REPO="https://raw.githubusercontent.com/okahari/okawhisp/main"
 INSTALL_DIR="$HOME/.local/share/okawhisp"
 BIN_DIR="$HOME/.local/bin"
 SERVICE_DIR="$HOME/.config/systemd/user"

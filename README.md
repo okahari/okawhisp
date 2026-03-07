@@ -21,7 +21,7 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, 4
 ## Installation
 
 ```bash
-curl -sSL https://github.com/username/okawhisp/raw/main/install.sh | bash
+curl -sSL https://github.com/okahari/okawhisp/raw/main/install.sh | bash
 ```
 
 That's it. The installer handles everything: dependencies, systemd service, GPU detection.
