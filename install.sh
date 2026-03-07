@@ -165,7 +165,14 @@ WantedBy=graphical-session.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now okawhisp.service
+systemctl --user enable okawhisp.service
+
+# Force restart to apply new config (even if already running)
+if systemctl --user is-active --quiet okawhisp.service; then
+    systemctl --user restart okawhisp.service
+else
+    systemctl --user start okawhisp.service
+fi
 ok "Service installed and started"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
