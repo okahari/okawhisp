@@ -75,6 +75,7 @@ python3 -c "import torch" 2>/dev/null || MISSING_PY+=("torch")
 python3 -c "import faster_whisper" 2>/dev/null || MISSING_PY+=("faster-whisper")
 python3 -c "import numpy" 2>/dev/null || MISSING_PY+=("numpy")
 python3 -c "import pyaudio" 2>/dev/null || MISSING_PY+=("pyaudio")
+python3 -c "import pynput" 2>/dev/null || MISSING_PY+=("pynput")
 
 python3 -c "import silero_vad" 2>/dev/null || MISSING_PY+=("silero-vad")
 
