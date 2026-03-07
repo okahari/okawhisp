@@ -227,16 +227,18 @@ case "$WHISPER_MODEL" in
     medium)   ESTIMATED_SEC=120; MODEL_MB=1500 ;;
     large-v3) ESTIMATED_SEC=240; MODEL_MB=3000 ;;
     *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
-esac
-
-info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
-echo ""
-
-MAX_WAIT=600  # 10 minutes (for slow connections or large models)
+MAX_WAIT=600  # 10 minutes
 WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${WHISPER_MODEL}"
 
 while [ $WAITED -lt $MAX_WAIT ]; do
+    # Check if service crashed
+    if ! systemctl --user is-active --quiet okawhisp.service; then
+        echo ""
+        err "Service crashed! Check logs: journalctl --user -u okawhisp -f"
+    fi
+    
     # Check if service is ready (hotkey listener started)
     if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -qE "(Starte Hotkey|🎹 Hotkey)"; then
         # Clear line and show completion
@@ -247,12 +249,15 @@ while [ $WAITED -lt $MAX_WAIT ]; do
         break
     fi
     
-    # Calculate progress (estimate)
-    if [ $WAITED -lt $ESTIMATED_SEC ]; then
-        PROGRESS=$((WAITED * 100 / ESTIMATED_SEC))
-    else
-        PROGRESS=$((95 + (WAITED - ESTIMATED_SEC) * 5 / 60))
+    # Calculate real progress based on downloaded size
+    if [ -d "$MODEL_CACHE_DIR" ]; then
+        DOWNLOADED_KB=$(du -sk "$MODEL_CACHE_DIR" 2>/dev/null | cut -f1)
+        DOWNLOADED_MB=$((DOWNLOADED_KB / 1024))
+        PROGRESS=$((DOWNLOADED_MB * 100 / MODEL_MB))
         [ $PROGRESS -gt 99 ] && PROGRESS=99
+    else
+        # Model download hasn't started yet
+        PROGRESS=0
     fi
     
     # Draw progress bar
@@ -264,9 +269,11 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     SPIN_IDX=$((WAITED % 10))
     SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
     
-    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%"
+    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}% (${DOWNLOADED_MB:-0}/${MODEL_MB} MB)"
     
     sleep 2
+    WAITED=$((WAITED + 2))
+done
     WAITED=$((WAITED + 2))
 done
 
