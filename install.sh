@@ -244,7 +244,15 @@ info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMAT
 info "Using hf_transfer for faster downloads..."
 echo ""
 
-MAX_WAIT=120  # 2 minutes (model loading takes 30-60s typically)
+# MAX_WAIT depends on model size (loading time varies)
+case "$WHISPER_MODEL" in
+    tiny)     MAX_WAIT=60 ;;
+    base)     MAX_WAIT=90 ;;
+    small)    MAX_WAIT=180 ;;
+    medium)   MAX_WAIT=300 ;;
+    large*)   MAX_WAIT=420 ;;  # 7 minutes for large
+    *)        MAX_WAIT=180 ;;
+esac
 WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
