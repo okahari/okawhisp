@@ -266,7 +266,7 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     SPIN_IDX=$((WAITED % 10))
     SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
     
-    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%  (${WAITED}s)"
+    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%"
     
     sleep 2
     WAITED=$((WAITED + 2))
