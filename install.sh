@@ -70,7 +70,7 @@ ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
 ok "Script installed to $INSTALL_DIR"
 
 # ── 4. Pre-warm dependencies (runs in background, first launch may be slow otherwise) ──
-info "Pre-installing Python dependencies (this takes ~30s on first run)..."
+info "Pre-installing Python dependencies (may take 1-5 min, downloads ~2GB with CUDA)..."
 "$UV" run --with faster-whisper --with silero-vad --with pyaudio --with numpy \
     python3 -c "import faster_whisper, numpy, pyaudio; print('deps OK')" 2>/dev/null \
     || info "Deps will be installed on first launch"
