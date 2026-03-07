@@ -570,8 +570,8 @@ def get_rms(data):
 
 DUCK_FADE_STEPS = 15        # Anzahl Schritte für sanften Volume-Fade
 DUCK_FADE_DURATION = 1.0    # Sekunden für Fade auf 0%
-DUCK_PRE_SOUND_PAUSE = 0.7  # Sekunden Stille vor Start-Sound
-DUCK_POST_SOUND_PAUSE = 1.0 # Sekunden Pause nach Stop-Sound bevor Musik weiterläuft
+DUCK_PRE_SOUND_PAUSE = 2.0  # Sekunden Stille vor Start-Sound
+DUCK_POST_SOUND_PAUSE = 2.0 # Sekunden Pause nach Stop-Sound bevor Musik hochfährt
 
 
 def _parse_sink_inputs_by_pid() -> tuple[list, list]:
@@ -697,7 +697,131 @@ def _set_sink_volumes(sinks: dict, volumes: dict):
             log.warning(f"  [set-vol] Fehler für Sink {sid}: {e}")
 
 
-# (unduck_audio entfernt - nicht mehr verwendet)
+def _get_other_sink_inputs() -> dict:
+    """Gibt {input_index: volume_pct} für alle fremden Sink-Inputs zurück.
+    
+    Filtert unseren eigenen Prozess (ffplay für Sounds) heraus.
+    """
+    my_pid = str(os.getpid())
+    inputs = {}
+    
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=3
+        )
+        
+        current = {}
+        for line in result.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("Sink Input #"):
+                if current.get("index") is not None and current.get("pid") != my_pid:
+                    inputs[current["index"]] = current.get("volume_pct", 100)
+                current = {"index": s.split("#")[1], "volume_pct": 100, "pid": ""}
+            elif s.startswith("Volume:") and "Base Volume" not in s:
+                for token in s.split():
+                    if token.endswith('%'):
+                        try:
+                            current["volume_pct"] = int(token.rstrip('%'))
+                        except ValueError:
+                            pass
+                        break
+            elif "application.process.id" in s and '"' in s:
+                current["pid"] = s.split('"')[1]
+        
+        # Letzten Eintrag
+        if current.get("index") is not None and current.get("pid") != my_pid:
+            inputs[current["index"]] = current.get("volume_pct", 100)
+            
+    except Exception as e:
+        log.warning(f"  [duck] Sink-Input-Liste fehlgeschlagen: {e}")
+    
+    return inputs
+
+
+def _fade_sink_inputs_to(inputs: dict, target_pct: int, duration: float = None):
+    """Fadet alle Sink-Inputs auf einen Ziel-Prozentsatz.
+    
+    Args:
+        inputs: {input_index: original_volume} 
+        target_pct: Ziel-Lautstärke in Prozent (0-100)
+        duration: Fade-Dauer in Sekunden
+    """
+    if not inputs:
+        return
+    if duration is None:
+        duration = DUCK_FADE_DURATION
+    
+    try:
+        step_delay = duration / DUCK_FADE_STEPS
+        
+        for step in range(1, DUCK_FADE_STEPS + 1):
+            factor = step / DUCK_FADE_STEPS
+            for idx, orig in inputs.items():
+                vol = int(orig + (target_pct - orig) * factor)
+                subprocess.run(["pactl", "set-sink-input-volume", idx, f"{vol}%"],
+                               capture_output=True, timeout=2)
+            time.sleep(step_delay)
+        
+        # Finale Werte setzen
+        for idx in inputs:
+            subprocess.run(["pactl", "set-sink-input-volume", idx, f"{target_pct}%"],
+                           capture_output=True, timeout=2)
+        log.debug(f"  [fade] {len(inputs)} Sink-Inputs auf {target_pct}% gefadet ({duration:.1f}s)")
+    except Exception as e:
+        log.warning(f"  [fade] Sink-Input-Fade fehlgeschlagen: {e}")
+
+
+def _restore_sink_inputs(inputs: dict, duration: float = None):
+    """Stellt Sink-Inputs auf ihre Original-Lautstärke wieder her (mit Fade)."""
+    if not inputs:
+        return
+    if duration is None:
+        duration = DUCK_FADE_DURATION
+    
+    try:
+        # Aktuelle Volumes holen
+        current = {}
+        result = subprocess.run(
+            ["pactl", "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=3
+        )
+        cur_entry = {}
+        for line in result.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("Sink Input #"):
+                if cur_entry.get("index"):
+                    current[cur_entry["index"]] = cur_entry.get("volume_pct", 0)
+                cur_entry = {"index": s.split("#")[1], "volume_pct": 0}
+            elif s.startswith("Volume:") and "Base Volume" not in s:
+                for token in s.split():
+                    if token.endswith('%'):
+                        try:
+                            cur_entry["volume_pct"] = int(token.rstrip('%'))
+                        except ValueError:
+                            pass
+                        break
+        if cur_entry.get("index"):
+            current[cur_entry["index"]] = cur_entry.get("volume_pct", 0)
+        
+        step_delay = duration / DUCK_FADE_STEPS
+        
+        for step in range(1, DUCK_FADE_STEPS + 1):
+            factor = step / DUCK_FADE_STEPS
+            for idx, orig in inputs.items():
+                cur = current.get(idx, 0)
+                vol = int(cur + (orig - cur) * factor)
+                subprocess.run(["pactl", "set-sink-input-volume", idx, f"{vol}%"],
+                               capture_output=True, timeout=2)
+            time.sleep(step_delay)
+        
+        # Finale Original-Werte setzen
+        for idx, orig in inputs.items():
+            subprocess.run(["pactl", "set-sink-input-volume", idx, f"{orig}%"],
+                           capture_output=True, timeout=2)
+        log.debug(f"  [restore] {len(inputs)} Sink-Inputs wiederhergestellt ({duration:.1f}s)")
+    except Exception as e:
+        log.warning(f"  [restore] Sink-Input-Restore fehlgeschlagen: {e}")
 
 
 def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
@@ -962,35 +1086,27 @@ def _run_voice_input():
             notify("❌ Audio-Fehler", f"Mic nicht bereit: {e}", "critical")
             return
 
-    # ── 2b. Original-Volumes erfassen ─────────────────────────────
-    _original_volumes = {}
+    # ── 2b. Fremde Sink-Inputs erfassen ────────────────────────────
+    # Duckt nur andere Apps (Spotify, Browser etc.), nicht unsere eigenen Sounds
+    _original_inputs = {}
     if DUCK_AUDIO_DURING_RECORDING:
-        _original_volumes = _get_all_sinks()
-        log.info(f"  [2b] 📊 Original-Volumes: {_original_volumes}")
+        _original_inputs = _get_other_sink_inputs()
+        log.info(f"  [2b] 📊 Fremde Sink-Inputs: {len(_original_inputs)} gefunden")
 
     # ── 2c. Musik auf 0% faden (sanfter Übergang) ────────────────
-    if DUCK_AUDIO_DURING_RECORDING and _original_volumes:
+    if DUCK_AUDIO_DURING_RECORDING and _original_inputs:
         log.info(f"  [2c] 🔇 Fade: Musik → 0% ({DUCK_FADE_DURATION}s)")
-        _fade_sinks_to(_original_volumes, 0)
-        # Kurze Stille vor dem Start-Sound
+        _fade_sink_inputs_to(_original_inputs, 0)
+        # Stille vor dem Start-Sound
         log.info(f"  [2c] 🤫 Stille-Pause ({DUCK_PRE_SOUND_PAUSE}s)")
         time.sleep(DUCK_PRE_SOUND_PAUSE)
 
-    # ── 2d. Start-Sound bei Original-Lautstärke ──────────────────
-    # Sinks kurz auf Original-Volume für den Sound
-    if DUCK_AUDIO_DURING_RECORDING and _original_volumes:
-        _set_sink_volumes(_original_volumes, _original_volumes)
-    log.info("  [2d] 🔔 Start-Sound (Original-Lautstärke)")
+    # ── 2d. Start-Sound (volle Lautstärke, Musik bleibt stumm) ───
+    # Sink-Inputs der anderen Apps sind auf 0%, unser Sound geht direkt durch
+    log.info("  [2d] 🔔 Start-Sound")
     play_sound("record_start")
     notify("🔴 Aufnahme", "Sprich jetzt…")
-    time.sleep(0.4)   # Sound fertig abspielen lassen
-    
-    # ── 2e. Musik wieder stumm für Aufnahme ──────────────────────
-    if DUCK_AUDIO_DURING_RECORDING and _original_volumes:
-        for sid in _original_volumes:
-            subprocess.run(["pactl", "set-sink-volume", sid, "0%"],
-                           capture_output=True, timeout=2)
-        log.info("  [2e] 🔇 Musik stumm für Aufnahme")
+    time.sleep(0.5)   # Sound fertig abspielen lassen
 
     # ── 2e. Kalibrierung (nur RMS-Fallback) ──────────────────────
     use_vad = VAD_ENABLED and _vad_model is not None
@@ -1026,20 +1142,16 @@ def _run_voice_input():
         except Exception as ex:
             log.warning(f"  [4] stop_stream() Fehler: {ex}")
 
-    # ── 5. Stop-Sound bei Original-Lautstärke ──────────────────────
-    # Sinks auf Original-Volume für den Stop-Sound
-    if DUCK_AUDIO_DURING_RECORDING and _original_volumes:
-        _set_sink_volumes(_original_volumes, _original_volumes)
-    log.info("  [5] 🔔 Stop-Sound (Original-Lautstärke)")
+    # ── 5. Stop-Sound (Musik ist noch stumm) ───────────────────────
+    log.info("  [5] 🔔 Stop-Sound")
     play_sound("record_end")
     
-    # ── 5b. Pause nach Stop-Sound ────────────────────────────────
-    # Musik bleibt auf Original-Volume (Stop-Sound hat es gesetzt)
-    # Pause damit der Sound ausklingt bevor Musik weiterläuft
-    if DUCK_AUDIO_DURING_RECORDING and _original_volumes:
+    # ── 5b. Pause nach Stop-Sound, dann Musik hochfahren ─────────
+    if DUCK_AUDIO_DURING_RECORDING and _original_inputs:
         log.info(f"  [5b] ⏸️  Pause nach Stop-Sound ({DUCK_POST_SOUND_PAUSE}s)")
         time.sleep(DUCK_POST_SOUND_PAUSE)
-        log.info("  [5b] 🔊 Musik läuft weiter (Original-Volume)")
+        log.info(f"  [5c] 🔊 Musik fährt hoch ({DUCK_FADE_DURATION}s)")
+        _restore_sink_inputs(_original_inputs)
     else:
         time.sleep(0.3)
 
