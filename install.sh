@@ -218,7 +218,6 @@ fi
 
 # Wait for service to be ready (model loaded)
 echo ""
-info "Downloading and loading Whisper model..."
 
 # Estimate download time based on model size
 case "$WHISPER_MODEL" in
@@ -230,8 +229,7 @@ case "$WHISPER_MODEL" in
     *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
 esac
 
-echo "  📦 Model size: ~${MODEL_MB} MB"
-echo "  ⏱️  Estimated time: ~$((ESTIMATED_SEC / 60)) minutes"
+info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
 echo ""
 
 MAX_WAIT=600  # 10 minutes (for slow connections or large models)
