@@ -121,13 +121,13 @@ if command -v nvidia-smi &>/dev/null; then
     fi
 fi
 
-# Recommend model based on VRAM
+# Recommend model based on VRAM (default to small for fast install)
 if [ $VRAM_GB -ge 8 ]; then
-    RECOMMENDED="large"
-    REASON="(8+ GB VRAM - best quality)"
+    RECOMMENDED="small"
+    REASON="(fast install, good quality - upgrade to 'large' later if needed)"
 elif [ $VRAM_GB -ge 6 ]; then
-    RECOMMENDED="medium"
-    REASON="(6-8 GB VRAM - high quality)"
+    RECOMMENDED="small"
+    REASON="(6-8 GB VRAM - good quality)"
 elif [ $VRAM_GB -ge 4 ]; then
     RECOMMENDED="small"
     REASON="(4-6 GB VRAM - good quality)"
@@ -234,7 +234,7 @@ echo "  📦 Model size: ~${MODEL_MB} MB"
 echo "  ⏱️  Estimated time: ~$((ESTIMATED_SEC / 60)) minutes"
 echo ""
 
-MAX_WAIT=300  # 5 minutes
+MAX_WAIT=600  # 10 minutes (for slow connections or large models)
 WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
