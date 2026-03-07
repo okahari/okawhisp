@@ -274,8 +274,6 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     sleep 2
     WAITED=$((WAITED + 2))
 done
-    WAITED=$((WAITED + 2))
-done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
     echo ""
