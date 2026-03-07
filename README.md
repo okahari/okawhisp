@@ -1,6 +1,6 @@
 # okawhisp
 
-**Fast local speech-to-text (STT) for Linux.** Press F9, speak, and your words appear in any focused window — terminal, editor, chat, browser, anything.
+**Fast local speech-to-text (STT) for Linux.** Press AltGr, speak, and your words appear in any focused window — terminal, editor, chat, browser, anything.
 
 Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, 4x faster than OpenAI Whisper) and [silero-vad](https://github.com/snakers4/silero-vad) for ML-based silence detection. Fully local, no cloud, runs on your GPU or CPU.
 
@@ -8,12 +8,11 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, 4
 
 ## Features
 
-- **Global hotkey** (F9 by default) — works in any window
+- **Global hotkey** (**AltGr** by default) — works in any window
+- **Configurable hotkey** — supports AltGr plus F1–F12 via config/CLI
 - **Auto-stop** via Voice Activity Detection (silero-vad) — stops when you stop talking
 - **Audio ducking** — background music fades during recording, restores afterward
 - **GPU-accelerated** transcription (CUDA) with CPU fallback
-- **Bluetooth mic support** — persistent PyAudio stream for reliable BT headsets
-- **Clipboard fallback** — uses gpaste-client, xclip, xsel, or wl-copy
 - **Systemd service** — runs in the background, auto-restarts on crash
 
 ---
@@ -33,7 +32,7 @@ That's it. The installer handles everything: dependencies, systemd service, GPU 
 Create `~/.config/okawhisp/config.toml`:
 
 ```toml
-key = "F9"
+key = "ALT_GR"   # Alternatives: F1..F12
 model = "large-v3"
 language = "de"
 engine = "faster"
@@ -69,7 +68,7 @@ CPU inference supported (int8 quantization). Use `tiny` or `base` for CPU-only s
 
 ## Usage
 
-Service runs automatically after install. Press **F9** to record.
+Service runs automatically after install. Press **AltGr** to record.
 
 Logs:
 ```bash
@@ -87,12 +86,12 @@ systemctl --user restart okawhisp.service
 
 ## How It Works
 
-1. **F9 pressed** → stream starts, background audio ducking enabled
+1. **AltGr pressed** → stream starts, background audio ducking enabled
 2. **Start sound** plays
 3. **Recording** — silero-vad processes 512-sample chunks (32ms each)
 4. **Auto-stop** — after configured silence duration following speech
 5. **Transcription** — faster-whisper converts audio to text
-6. **Output** — xdotool types text into focused window + clipboard fallback
+6. **Output** — xdotool types text into the focused window
 7. **Unduck** — background audio restored, stop sound plays
 
 ---
