@@ -86,7 +86,7 @@ check_and_install() {
         
         # Detect if in virtualenv - use different pip flags
         local pip_flags=""
-        if [ -z "$VIRTUAL_ENV" ]; then
+        if [ -z "${VIRTUAL_ENV:-}" ]; then
             # Not in virtualenv - use --user --break-system-packages
             pip_flags="--user --break-system-packages"
         fi
