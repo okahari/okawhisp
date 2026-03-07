@@ -104,6 +104,16 @@ check_and_install "faster-whisper" "faster_whisper"
 check_and_install "silero-vad" "silero_vad"
 check_and_install "pynput"
 
+# Install hf_transfer for 3-5x faster HuggingFace downloads
+if ! python3 -c "import hf_transfer" 2>/dev/null; then
+    echo -n "  Installing hf_transfer for faster downloads... "
+    if pip install --user --break-system-packages hf_transfer >/dev/null 2>&1; then
+        echo -e "${GREEN}done${NC}"
+    else
+        echo -e "${YELLOW}skipped (optional)${NC}"
+    fi
+fi
+
 echo ""
 ok "Python dependencies ready"
 
