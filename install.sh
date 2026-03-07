@@ -243,10 +243,13 @@ esac
 
 MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${MODEL_REPO_NAME}"
 
-# Python download script runs in background
-export HF_HUB_ENABLE_HF_TRANSFER=1
-python3 << 'DOWNLOAD_SCRIPT' &
+# Python download script runs in background (with hf_transfer enabled)
+HF_HUB_ENABLE_HF_TRANSFER=1 WHISPER_MODEL="$WHISPER_MODEL" python3 << 'DOWNLOAD_SCRIPT' &
 import sys, os
+
+# Enable hf_transfer for faster downloads
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 from huggingface_hub import snapshot_download
 
 model_name = os.environ.get("WHISPER_MODEL", "small")
