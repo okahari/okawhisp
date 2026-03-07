@@ -1198,51 +1198,15 @@ def _run_voice_input():
 
     log.info(f"  [7] 📝 [{lang}] ({elapsed_trans:.1f}s) {text}")
 
-    # ── 8. Text in Clipboard + OpenClaw senden ──────────────────
-    
-    # 8a. IMMER in Clipboard kopieren (Backup)
-    clipboard_ok = False
-    _clipboard_tools = [
-        ['gpaste-client'],                          # GPaste: liest Text von stdin
-        ['xclip', '-selection', 'clipboard'],
-        ['xsel', '--clipboard', '--input'],
-        ['wl-copy'],
-    ]
-    for tool_cmd in _clipboard_tools:
-        try:
-            subprocess.run(
-                tool_cmd,
-                input=text.encode(), check=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=3
-            )
-            clipboard_ok = True
-            log.info(f"  [8] 📋 Text copied to clipboard (via {tool_cmd[0]})")
-            break
-        except FileNotFoundError:
-            continue  # Tool not installed → try next
-        except Exception as e:
-            log.warning(f"  [8] ⚠️ Clipboard via {tool_cmd[0]} failed: {e}")
-            break
-
-    if not clipboard_ok:
-        log.warning("  [8] ⚠️ No clipboard tool available (xclip/xsel/wl-copy)")
-
-    # Dann versuchen zu tippen
+    # ── 8. Type text into active window ─────────────────────────
     time.sleep(0.3)
     typed = type_text(text)
-    if typed and clipboard_ok:
-        notify("✅ Typed + 📋 Clipboard", text[:80])
-        log.info("  [8] ✅ Text typed into window UND in Clipboard")
-    elif typed:
+    if typed:
         notify("✅ Typed", text[:80])
-        log.info("  [8] ✅ Text typed into window (Clipboard failed)")
-    elif clipboard_ok:
-        notify("📋 Clipboard", f"Text copied (Typing failed): {text[:80]}")
-        log.info("  [8] 📋 Clipboard only (xdotool failed)")
+        log.info("  [8] ✅ Text typed into window")
     else:
-        notify("⚠️ Error", "Neither typing nor clipboard works", urgency="critical")
-        log.error("  [8] ❌ Neither xdotool nor clipboard tool available")
+        notify("⚠️ Error", "Typing failed (xdotool)", urgency="critical")
+        log.error("  [8] ❌ xdotool typing failed")
 
 
 def listen_keyboard_hotkey(hotkey):
