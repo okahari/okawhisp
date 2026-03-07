@@ -1296,6 +1296,9 @@ Config File: ~/.config/voice-type/config.toml
     else:
         # Whisper-Modell lokal laden
         print(f"  📦 Lade Whisper-Modell '{MODEL_SIZE}' ({engine_type} engine)...")
+        if MODEL_SIZE in ["large-v3", "medium"]:
+            print(f"     ⏳ First download: ~2-3 GB, this may take a few minutes...")
+        print(f"     Progress may not be visible, please be patient.")
         load_start = time.time()
         try:
             if engine_type == "faster":
