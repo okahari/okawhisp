@@ -137,35 +137,37 @@ if command -v nvidia-smi &>/dev/null; then
     fi
 fi
 
-if   [ "$VRAM_GB" -ge 8 ]; then RECOMMENDED="large";  REASON="(8+ GB VRAM — best quality)"
-elif [ "$VRAM_GB" -ge 6 ]; then RECOMMENDED="medium"; REASON="(6-8 GB VRAM — high quality)"
-elif [ "$VRAM_GB" -ge 4 ]; then RECOMMENDED="small";  REASON="(4-6 GB VRAM — good quality)"
-elif [ "$VRAM_GB" -ge 2 ]; then RECOMMENDED="base";   REASON="(2-4 GB VRAM — decent quality)"
-else                             RECOMMENDED="tiny";   REASON="(CPU / low VRAM — fast)"
+if   [ "$VRAM_GB" -ge 8 ]; then RECOMMENDED="large-v3"; REASON="(8+ GB VRAM — best quality)"
+elif [ "$VRAM_GB" -ge 6 ]; then RECOMMENDED="medium";   REASON="(6-8 GB VRAM — high quality)"
+elif [ "$VRAM_GB" -ge 4 ]; then RECOMMENDED="small";    REASON="(4-6 GB VRAM — good quality)"
+elif [ "$VRAM_GB" -ge 2 ]; then RECOMMENDED="base";     REASON="(2-4 GB VRAM — decent quality)"
+else                             RECOMMENDED="tiny";     REASON="(CPU / low VRAM — fast)"
 fi
 
 echo ""
 info "Whisper model selection:"
 echo ""
-echo "  tiny   — 75 MB,   very fast, decent quality"
-echo "  base   — 145 MB,  fast,      good quality"
-echo "  small  — 470 MB,  medium,    good quality"
-echo "  medium — 1.5 GB,  slower,    high quality"
-echo "  large  — 3 GB,    slowest,   best quality"
+echo "  tiny     — 75 MB,   very fast, decent quality"
+echo "  base     — 145 MB,  fast,      good quality"
+echo "  small    — 470 MB,  medium,    good quality"
+echo "  medium   — 1.5 GB,  slower,    high quality"
+echo "  large-v3 — 3 GB,    slowest,   best quality"
 echo ""
 echo "  Recommended for your system: ${RECOMMENDED} ${REASON}"
 echo ""
-read -rp "  Choose model [${RECOMMENDED}]: " MODEL_CHOICE
+# </dev/tty so read works even when script is piped via curl | bash
+read -rp "  Choose model [${RECOMMENDED}]: " MODEL_CHOICE </dev/tty
 MODEL_CHOICE="${MODEL_CHOICE:-$RECOMMENDED}"
 
 case "$MODEL_CHOICE" in
-    tiny)   WHISPER_MODEL="tiny" ;;
-    base)   WHISPER_MODEL="base" ;;
-    small)  WHISPER_MODEL="small" ;;
-    medium) WHISPER_MODEL="medium" ;;
-    large)  WHISPER_MODEL="large-v3" ;;
-    *)      warn "Unknown model '${MODEL_CHOICE}', using '${RECOMMENDED}'."
-            WHISPER_MODEL="$RECOMMENDED" ;;
+    tiny)         WHISPER_MODEL="tiny" ;;
+    base)         WHISPER_MODEL="base" ;;
+    small)        WHISPER_MODEL="small" ;;
+    medium)       WHISPER_MODEL="medium" ;;
+    large|large-v3) WHISPER_MODEL="large-v3" ;;
+    *)            WHISPER_MODEL="$RECOMMENDED"
+                  # Re-apply mapping in case RECOMMENDED is a display name (e.g. "large")
+                  [ "$WHISPER_MODEL" = "large" ] && WHISPER_MODEL="large-v3" ;;
 esac
 
 # Map model name to HuggingFace repo
@@ -316,7 +318,8 @@ EOF
         systemctl --user enable okawhisp.service
 
         # Timestamp BEFORE starting — journal polling will only look at entries after this
-        START_TIME="$(date -u +'%Y-%m-%d %H:%M:%S')"
+        # Use local time (no -u) — journalctl --since expects local time
+        START_TIME="$(date +'%Y-%m-%d %H:%M:%S')"
 
         if systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
             info "Restarting service with new config..."
@@ -328,8 +331,8 @@ EOF
 
         # Wait for ready signal — ONLY check logs written AFTER we started the service
         echo ""
-        info "Waiting for service to become ready..."
-        MAX_WAIT=60
+        info "Waiting for service to become ready (model download may take several minutes)..."
+        MAX_WAIT=600
         WAITED=0
         READY=0
 
