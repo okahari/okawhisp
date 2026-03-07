@@ -10,6 +10,7 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, 4
 
 - **Global hotkey** (**AltGr** by default) — works in any window
 - **Configurable hotkey** — supports AltGr plus F1–F12 via config/CLI
+- **One-key flow** — press the hotkey to start recording; speech end/silence triggers automatic stop + send
 - **Auto-stop** via Voice Activity Detection (silero-vad) — stops when you stop talking
 - **Audio ducking** — background music fades during recording, restores afterward
 - **GPU-accelerated** transcription (CUDA) with CPU fallback
