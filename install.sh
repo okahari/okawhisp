@@ -232,13 +232,13 @@ esac
 info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
 echo ""
 
-MAX_WAIT=600  # 10 minutes (for slow connections or large models)
+MAX_WAIT=120  # 2 minutes (model loading takes 30-60s typically)
 WAITED=0
 SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 while [ $WAITED -lt $MAX_WAIT ]; do
-    # Check if service is ready (hotkey listener started)
-    if journalctl --user -u okawhisp.service --no-pager 2>/dev/null | grep -qE "(Starte Hotkey|🎹 Hotkey)"; then
+    # Check if service is ready (look for exact hotkey message in recent logs)
+    if journalctl --user -u okawhisp.service --since "3 minutes ago" --no-pager 2>/dev/null | grep -qE "(Starte Hotkey-Listener|🎹 Hotkey: F9)"; then
         # Clear line and show completion
         echo -ne "\r\033[K"
         echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100% ✓ Model loaded!"
@@ -247,7 +247,13 @@ while [ $WAITED -lt $MAX_WAIT ]; do
         break
     fi
     
-    # Calculate progress (estimate)
+    # Check if service crashed
+    if ! systemctl --user is-active --quiet okawhisp.service; then
+        echo -ne "\r\033[K"
+        err "Service crashed! Check logs: journalctl --user -u okawhisp -n 50"
+    fi
+    
+    # Calculate progress (estimate based on time)
     if [ $WAITED -lt $ESTIMATED_SEC ]; then
         PROGRESS=$((WAITED * 100 / ESTIMATED_SEC))
     else
@@ -264,15 +270,15 @@ while [ $WAITED -lt $MAX_WAIT ]; do
     SPIN_IDX=$((WAITED % 10))
     SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
     
-    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%"
+    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}% (${WAITED}s elapsed)"
     
     sleep 2
     WAITED=$((WAITED + 2))
 done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
-    echo ""
-    err "Service did not start in time. Check logs: journalctl --user -u okawhisp -f"
+    echo -ne "\r\033[K"
+    err "Service did not start in time (${MAX_WAIT}s). Check: journalctl --user -u okawhisp -n 50"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
