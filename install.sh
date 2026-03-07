@@ -190,6 +190,7 @@ Environment="XAUTHORITY=${XAUTH_VAL}"
 Environment="XDG_RUNTIME_DIR=/run/user/${UID_VAL}"
 Environment="PYTHONUNBUFFERED=1"
 Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="HF_HUB_ENABLE_HF_TRANSFER=1"
 
 Restart=always
 RestartSec=5s
@@ -230,6 +231,7 @@ case "$WHISPER_MODEL" in
 esac
 
 info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
+info "Using hf_transfer for faster downloads..."
 echo ""
 
 MAX_WAIT=120  # 2 minutes (model loading takes 30-60s typically)
