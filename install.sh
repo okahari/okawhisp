@@ -235,11 +235,17 @@ esac
 info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB)..."
 echo ""
 
-# Start download in background and monitor cache dir
-MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${WHISPER_MODEL}"
+# Map model name to repo name for cache dir
+case "$WHISPER_MODEL" in
+    large) MODEL_REPO_NAME="large-v3" ;;
+    *) MODEL_REPO_NAME="$WHISPER_MODEL" ;;
+esac
+
+MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${MODEL_REPO_NAME}"
 
 # Python download script runs in background
-HF_HUB_ENABLE_HF_TRANSFER=1 python3 << 'DOWNLOAD_SCRIPT' &
+export HF_HUB_ENABLE_HF_TRANSFER=1
+python3 << 'DOWNLOAD_SCRIPT' &
 import sys, os
 from huggingface_hub import snapshot_download
 
