@@ -107,7 +107,25 @@ check_and_install "pynput"
 echo ""
 ok "Python dependencies ready"
 
-# ── 5. Systemd service ────────────────────────────────────────────────────────
+# ── 5. Model selection ────────────────────────────────────────────────────────
+echo ""
+info "Whisper model selection:"
+echo ""
+echo "  small  - 244 MB download, fast, good quality (recommended)"
+echo "  large  - 2.9 GB download, best quality, slower first start"
+echo ""
+read -p "Choose model [small]: " MODEL_CHOICE
+MODEL_CHOICE=${MODEL_CHOICE:-small}
+
+if [ "$MODEL_CHOICE" = "large" ]; then
+    WHISPER_MODEL="large-v3"
+    info "Selected: large-v3 (first start will download ~2.9 GB, be patient!)"
+else
+    WHISPER_MODEL="small"
+    info "Selected: small (fast download)"
+fi
+
+# ── 6. Systemd service ────────────────────────────────────────────────────────
 info "Installing systemd service..."
 mkdir -p "$SERVICE_DIR"
 
@@ -125,7 +143,7 @@ StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${SCRIPT} --key F9 --model large-v3 --engine faster --language de --beam-size 5 --silence 2.0
+ExecStart=/usr/bin/python3 ${SCRIPT} --key F9 --model ${WHISPER_MODEL} --engine faster --language de --beam-size 5 --silence 2.0
 
 Environment="DISPLAY=${DISPLAY_VAL}"
 Environment="XAUTHORITY=${XAUTH_VAL}"
