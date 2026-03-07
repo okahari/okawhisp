@@ -33,23 +33,27 @@ curl -sSL https://github.com/okahari/okawhisp/raw/main/install.sh | bash
 Create `~/.config/okawhisp/config.toml`:
 
 ```toml
-key = "ALT_GR"   # Alternatives: F1..F12
+[recording]
+key = "ALT_GR"      # Alternatives: F1..F12
 model = "large-v3"
 language = "de"
 engine = "faster"
 beam_size = 5
 silence = 2.5
-prompt = "NestJS, Flutter, Kubernetes"
+# Optional hint words for domain terms/names.
+# Default is empty (no prompt).
+prompt = ""         # Example: "PostgreSQL, Supabase, Tailwind"
+
+[vad]
+enabled = true
+threshold = 0.5
+min_silence_ms = 2500
+
+[duck]
+enabled = true
 ```
 
-Or set environment variables:
-
-```bash
-VAD_ENABLED=True                  # Enable silero-vad (default: True)
-VAD_THRESHOLD=0.5                 # Speech probability (0.0–1.0)
-VAD_MIN_SILENCE_MS=2500           # Silence before stop (ms)
-DUCK_AUDIO_DURING_RECORDING=True  # Fade background audio
-```
+`prompt` is optional. Leave it empty unless you regularly dictate specific names, product terms, or uncommon words.
 
 ---
 
