@@ -245,10 +245,9 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}  ✓ okawhisp installed!${NC}"
+echo -e "${GREEN}  ✓ okawhisp installed and ready!${NC}"
 echo ""
 echo "  Press F9 to start recording."
-echo "  First start downloads the Whisper model (~1-3 GB) — be patient."
 echo ""
 echo "  Logs:    journalctl --user -u okawhisp -f"
 echo "  Restart: systemctl --user restart okawhisp"
