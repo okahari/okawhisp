@@ -120,6 +120,7 @@ check_and_install "faster-whisper"     "faster_whisper"
 check_and_install "silero-vad"         "silero_vad"
 check_and_install "pynput"
 check_and_install "huggingface_hub"    "huggingface_hub"
+check_and_install "hf-transfer"        "hf_transfer"
 
 echo ""
 ok "Python dependencies ready"
@@ -196,8 +197,32 @@ python3 - <<PYEOF
 import sys, os
 from pathlib import Path
 
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)  # keep tqdm enabled
+# ── Fast parallel download via hf_transfer (Rust, multi-thread) ──────────────
+_HF_FAST = False
+try:
+    import hf_transfer as _  # noqa – just check it's importable
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    _HF_FAST = True
+except ImportError:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+
+# ── Force tqdm to stdout, always enabled (patch BEFORE importing huggingface_hub)
+import tqdm as _tqdm
+import tqdm.auto as _tqdm_auto
+
+class _Tqdm(_tqdm.tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = False
+        kwargs["file"]    = sys.stdout
+        super().__init__(*args, **kwargs)
+
+_tqdm.tqdm      = _Tqdm
+_tqdm_auto.tqdm = _Tqdm
+
+# ── Now import huggingface_hub (will use our patched tqdm) ───────────────────
+from huggingface_hub import repo_info, hf_hub_download, try_to_load_from_cache
 
 GREEN  = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -211,10 +236,9 @@ def fmt_size(n):
     return f"{n} B"
 
 try:
-    from huggingface_hub import repo_info, hf_hub_download, try_to_load_from_cache
-
     repo_id = "${HF_REPO}"
-    sys.stdout.write("  Fetching file list from HuggingFace...\n")
+    mode    = f"{'hf-transfer (parallel)' if _HF_FAST else 'standard'}"
+    sys.stdout.write(f"  Fetching file list from HuggingFace... [{mode}]\n")
     sys.stdout.flush()
 
     meta  = repo_info(repo_id, files_metadata=True)
@@ -237,7 +261,7 @@ try:
     if not to_dl:
         sys.stdout.write(
             f"  {GREEN}All {len(files)} files already cached{NC}"
-            f" ({fmt_size(total_size)} total)\n"
+            f" ({fmt_size(total_size)} total)\n\n"
         )
         sys.stdout.flush()
     else:
@@ -250,19 +274,14 @@ try:
         sys.stdout.flush()
 
         for i, (fname, size) in enumerate(to_dl, 1):
-            label = f"  [{i}/{len(to_dl)}]"
-            sys.stdout.write(f"{label} {fname}  ({fmt_size(size)}) ...\n")
+            sys.stdout.write(f"  [{i}/{len(to_dl)}] {fname}  ({fmt_size(size)})\n")
             sys.stdout.flush()
-            # hf_hub_download prints a tqdm bar to stderr during the transfer
             hf_hub_download(repo_id=repo_id, filename=fname)
-            sys.stdout.write(f"{label} {GREEN}done{NC}  {fname}\n")
+            sys.stdout.write(f"  [{i}/{len(to_dl)}] {GREEN}done{NC}  {fname}\n\n")
             sys.stdout.flush()
-
-    sys.stdout.write("\n")
-    sys.stdout.flush()
 
 except Exception as exc:
-    sys.stdout.write(f"  {YELLOW}Warning:{NC} {exc}\n")
+    sys.stdout.write(f"\n  {YELLOW}Warning:{NC} {exc}\n")
     sys.stdout.write("  Model will be downloaded when the service first starts.\n\n")
     sys.stdout.flush()
 PYEOF
