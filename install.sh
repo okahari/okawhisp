@@ -217,29 +217,63 @@ else
 fi
 
 # Wait for service to be ready (model loaded)
-info "Waiting for model download and service initialization..."
-echo "     This may take 1-5 minutes depending on model size."
+echo ""
+info "Downloading and loading Whisper model..."
+
+# Estimate download time based on model size
+case "$WHISPER_MODEL" in
+    tiny)     ESTIMATED_SEC=10; MODEL_MB=75 ;;
+    base)     ESTIMATED_SEC=20; MODEL_MB=145 ;;
+    small)    ESTIMATED_SEC=60; MODEL_MB=470 ;;
+    medium)   ESTIMATED_SEC=120; MODEL_MB=1500 ;;
+    large-v3) ESTIMATED_SEC=240; MODEL_MB=3000 ;;
+    *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
+esac
+
+echo "  📦 Model size: ~${MODEL_MB} MB"
+echo "  ⏱️  Estimated time: ~$((ESTIMATED_SEC / 60)) minutes"
 echo ""
 
 MAX_WAIT=300  # 5 minutes
 WAITED=0
+SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 while [ $WAITED -lt $MAX_WAIT ]; do
     # Check if service is ready (hotkey listener started)
     if journalctl --user -u okawhisp.service --since "30 seconds ago" 2>/dev/null | grep -q "Hotkey-Listener"; then
+        # Clear line and show completion
+        echo -ne "\r\033[K"
+        echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100% ✓ Model loaded!"
+        echo ""
         ok "Service ready!"
         break
     fi
     
-    # Show progress every 10 seconds
-    if [ $((WAITED % 10)) -eq 0 ] && [ $WAITED -gt 0 ]; then
-        echo -n "."
+    # Calculate progress (estimate)
+    if [ $WAITED -lt $ESTIMATED_SEC ]; then
+        PROGRESS=$((WAITED * 100 / ESTIMATED_SEC))
+    else
+        PROGRESS=$((95 + (WAITED - ESTIMATED_SEC) * 5 / 60))
+        [ $PROGRESS -gt 99 ] && PROGRESS=99
     fi
+    
+    # Draw progress bar
+    FILLED=$((PROGRESS / 5))
+    EMPTY=$((20 - FILLED))
+    BAR=$(printf "${GREEN}▓%.0s${NC}" $(seq 1 $FILLED))$(printf "░%.0s" $(seq 1 $EMPTY))
+    
+    # Spinner animation
+    SPIN_IDX=$((WAITED % 10))
+    SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
+    
+    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}%  (${WAITED}s)"
     
     sleep 2
     WAITED=$((WAITED + 2))
 done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
+    echo ""
     err "Service did not start in time. Check logs: journalctl --user -u okawhisp -f"
 fi
 
