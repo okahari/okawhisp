@@ -323,17 +323,19 @@ EOF
             systemctl --user start okawhisp.service
         fi
 
-        # Stream live service output until ready signal is found (or timeout)
+        # Stream filtered service output until ready signal is found (or timeout)
         echo ""
-        info "Loading model — live output (large-v3 takes ~2-4 min on first start):"
+        info "Starting service..."
         echo ""
 
         EXIT_CODE=0
         timeout 600 bash -c '
             journalctl --user -u okawhisp.service \
                 --since "'"$START_TIME"'" -f -o cat 2>/dev/null | \
+            grep --line-buffered -vE \
+                "^(Stopping|Stopped|Started|Failed|okawhisp\.service:)|={5,}|OkaWhisp (beendet|gestartet|- System)|Log-Datei:|Progress may not|^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | \
             while IFS= read -r line; do
-                printf "  %s\n" "$line"
+                [ -n "$line" ] && printf "  %s\n" "$line"
                 if printf "%s\n" "$line" | grep -qiE "(Starte Hotkey|🎹|Hotkey listener|bereit|ready|listening)"; then
                     exit 0
                 fi

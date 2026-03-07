@@ -9,3 +9,6 @@ venv/
 *.wav
 # Don't commit personal config (may contain API keys)
 config.toml
+# Editor / tool artifacts
+.claude/
+*.bak
