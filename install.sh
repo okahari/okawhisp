@@ -87,8 +87,9 @@ else
     
     # Install via pip --user (uses system site-packages, no isolated env)
     for pkg in "${MISSING_PY[@]}"; do
-        python3 -m pip install --user --break-system-packages "$pkg" --quiet 2>/dev/null \
-            || info "Could not install $pkg - will be installed on first launch"
+        if ! python3 -m pip install --user --break-system-packages "$pkg" >/dev/null 2>&1; then
+            err "Failed to install $pkg. Aborting."
+        fi
     done
     ok "Python dependencies installed"
 fi
