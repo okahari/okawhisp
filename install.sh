@@ -84,21 +84,14 @@ check_and_install() {
         echo -e "${YELLOW}missing${NC}"
         echo -n "  Installing $pkg... "
         
-        # Detect if in virtualenv - use different pip flags
-        local pip_flags=""
-        if [ -z "${VIRTUAL_ENV:-}" ]; then
-            # Not in virtualenv - use --user --break-system-packages
-            pip_flags="--user --break-system-packages"
-        fi
-        
-        if python3 -m pip install $pip_flags "$pkg" >/dev/null 2>&1; then
+        if python3 -m pip install --user --break-system-packages "$pkg" >/dev/null 2>&1; then
             echo -e "${GREEN}OK${NC}"
             return 0
         else
             echo -e "${RED}FAILED${NC}"
             echo ""
             echo "  Trying to install $pkg with verbose output:"
-            python3 -m pip install $pip_flags "$pkg"
+            python3 -m pip install --user --break-system-packages "$pkg"
             return $?
         fi
     fi
