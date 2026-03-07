@@ -7,11 +7,12 @@
 #   "faster-whisper",
 #   "silero-vad>=6.0",
 #   "torch",
+#   "pynput",
 # ]
 # ///
 """
-Voice Type - System-Level Voice-to-Text für jedes Fenster
-==========================================================
+OkaWhisp - System-Level Voice-to-Text für jedes Fenster
+========================================================
 
 Globaler Hotkey → Mikrofon aufnehmen → Stille-Erkennung stoppt automatisch
 → Whisper transkribiert → Text wird direkt ins aktive Fenster getippt
@@ -24,17 +25,17 @@ Engines:
   - api: OpenAI-kompatible API (OpenAI, Groq, lokaler Whisper-Server, …)
 
 Config File (optional):
-  ~/.config/voice-type/config.toml  →  Defaults setzen, kein CLI nötig
+  ~/.config/okawhisp/config.toml  →  Defaults setzen, kein CLI nötig
 
 Verwendung:
-  python voice-type.py                          # Standard: F9, medium, deutsch
-  python voice-type.py --key F8                 # Anderer Hotkey
-  python voice-type.py --model small            # Kleineres Modell
-  python voice-type.py --language en            # Englisch
-  python voice-type.py --engine openai          # Lokales OpenAI Whisper
-  python voice-type.py --engine api             # OpenAI-kompatible API
-  python voice-type.py --api-url https://api.groq.com/openai/v1 --api-key KEY
-  python voice-type.py --prompt "NestJS, Flutter"  # Kontext-Hints
+  python okawhisp.py                          # Standard: F9, medium, deutsch
+  python okawhisp.py --key F8                 # Anderer Hotkey
+  python okawhisp.py --model small            # Kleineres Modell
+  python okawhisp.py --language en            # Englisch
+  python okawhisp.py --engine openai          # Lokales OpenAI Whisper
+  python okawhisp.py --engine api             # OpenAI-kompatible API
+  python okawhisp.py --api-url https://api.groq.com/openai/v1 --api-key KEY
+  python okawhisp.py --prompt "NestJS, Flutter"  # Kontext-Hints
 """
 
 import pyaudio
@@ -65,7 +66,7 @@ warnings.filterwarnings("ignore")
 
 # ─── Logging Setup ───────────────────────────────────────────────
 
-LOG_FILE = os.path.expanduser("~/.local/share/voice-type/voice-type.log")
+LOG_FILE = os.path.expanduser("~/.local/share/okawhisp/okawhisp.log")
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
 _log_formatter = logging.Formatter(
@@ -73,7 +74,7 @@ _log_formatter = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-log = logging.getLogger("voice-type")
+log = logging.getLogger("okawhisp")
 log.setLevel(logging.DEBUG)
 
 # Datei-Handler (rotierend: max 2MB, 3 Backups)
@@ -125,8 +126,8 @@ DUCK_AUDIO_DURING_RECORDING = True
 DUCK_SINK_LEVEL = 10        # % auf den alle Sinks reduziert werden (Catch-All für Musik etc.)
 
 # Benutzerdefinierte Sounds (werden bevorzugt abgespielt, falls vorhanden)
-CUSTOM_RECORD_START_SOUND = None  # Optional: Pfad zu einer MP3-Datei, z.B. "/home/user/sounds/start.mp3"
-CUSTOM_RECORD_END_SOUND = None    # Optional: Pfad zu einer MP3-Datei, z.B. "/home/user/sounds/stop.mp3"
+CUSTOM_RECORD_START_SOUND = "/home/okahari/Musik/sounds/freesound_community-light-switch-81967.mp3"
+CUSTOM_RECORD_END_SOUND = "/home/okahari/Musik/sounds/peggy_marco-screenshot-iphone-sound-336170.mp3"
 
 # ── OpenAI-kompatible API (engine=api) ───────────────────────────
 # Funktioniert mit: OpenAI, Groq, lokaler whisper.cpp-Server, u.a.
@@ -137,7 +138,7 @@ WHISPER_API_MODEL    = "whisper-1"
 # ─── Config File ─────────────────────────────────────────────────
 
 def load_config() -> dict:
-    """Lädt ~/.config/voice-type/config.toml (oder ~/.voice-type.toml).
+    """Lädt ~/.config/okawhisp/config.toml (oder ~/.okawhisp.toml).
 
     Gibt leeres Dict zurück wenn kein Config-File gefunden oder TOML nicht verfügbar.
     CLI-Argumente haben immer Vorrang über Config-File-Werte.
@@ -170,8 +171,8 @@ def load_config() -> dict:
     if tomllib is None:
         return {}
     config_paths = [
-        Path.home() / ".config" / "voice-type" / "config.toml",
-        Path.home() / ".voice-type.toml",
+        Path.home() / ".config" / "okawhisp" / "config.toml",
+        Path.home() / ".okawhisp.toml",
     ]
     for path in config_paths:
         if path.exists():
@@ -1191,14 +1192,14 @@ def main():
     if api_cfg.get("model"):              WHISPER_API_MODEL    = api_cfg["model"]
 
     parser = argparse.ArgumentParser(
-        description='Voice Type - System-Level Voice Input',
+        description='OkaWhisp - System-Level Voice Input',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Beispiele:
-  python voice-type.py                                       # Standard (F9, medium, deutsch)
-  python voice-type.py --model small --language en           # Englisch, schneller
-  python voice-type.py --engine api --api-key sk-...         # OpenAI API
-  python voice-type.py --engine api \\
+  python okawhisp.py                                       # Standard (F9, medium, deutsch)
+  python okawhisp.py --model small --language en           # Englisch, schneller
+  python okawhisp.py --engine api --api-key sk-...         # OpenAI API
+  python okawhisp.py --engine api \\
     --api-url https://api.groq.com/openai/v1 --api-key gsk_  # Groq (kostenlos, schnell)
   python voice-type.py --prompt "NestJS, Flutter, API"       # Fachbegriffe als Kontext
   python voice-type.py --beam-size 1                         # Schneller, etwas ungenauer
@@ -1247,11 +1248,11 @@ Config File: ~/.config/voice-type/config.toml
 
     print()
     print("=" * 60)
-    print("🎤 Voice Type - System-Level Voice Input")
+    print("🎤 OkaWhisp - System-Level Voice Input")
     print("=" * 60)
     print()
     log.info("=" * 60)
-    log.info("🎤 Voice Type gestartet")
+    log.info("🎤 OkaWhisp gestartet")
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
 
@@ -1259,7 +1260,7 @@ Config File: ~/.config/voice-type/config.toml
     def signal_handler(sig, frame):
         global should_exit
         should_exit = True
-        print("\n\n👋 Voice Type beendet.")
+        print("\n\n👋 OkaWhisp beendet.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)

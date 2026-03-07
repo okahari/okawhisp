@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# voice-type installer
-# Usage: curl -sSL https://raw.githubusercontent.com/YOUR_USER/voice-type/main/install.sh | bash
+# okawhisp installer
+# Usage: curl -sSL https://raw.githubusercontent.com/YOUR_USER/okawhisp/main/install.sh | bash
 set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/YOUR_USER/voice-type/main"
-INSTALL_DIR="$HOME/.local/share/voice-type"
+REPO="https://raw.githubusercontent.com/YOUR_USER/okawhisp/main"
+INSTALL_DIR="$HOME/.local/share/okawhisp"
 BIN_DIR="$HOME/.local/bin"
 SERVICE_DIR="$HOME/.config/systemd/user"
-SCRIPT="$INSTALL_DIR/voice-type.py"
-SERVICE="$SERVICE_DIR/voice-type.service"
+SCRIPT="$INSTALL_DIR/okawhisp.py"
+SERVICE="$SERVICE_DIR/okawhisp.service"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -17,7 +17,7 @@ info() { echo -e "${YELLOW}→${NC} $*"; }
 err()  { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
 
 echo ""
-echo "  🎤  voice-type installer"
+echo "  🎤  okawhisp installer"
 echo "  ─────────────────────────────────────"
 echo ""
 
@@ -56,13 +56,13 @@ UV="${HOME}/.local/bin/uv"
 ok "uv ready: $UV"
 
 # ── 3. Download script ────────────────────────────────────────────────────────
-info "Installing voice-type script..."
+info "Installing okawhisp script..."
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-curl -sSL "$REPO/voice-type.py" -o "$SCRIPT"
+curl -sSL "$REPO/okawhisp.py" -o "$SCRIPT"
 chmod +x "$SCRIPT"
 
 # Convenience symlink
-ln -sf "$SCRIPT" "$BIN_DIR/voice-type"
+ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
 ok "Script installed to $SCRIPT"
 
 # ── 4. Pre-warm dependencies (runs in background, first launch may be slow otherwise) ──
@@ -82,7 +82,7 @@ UID_VAL="$(id -u)"
 
 cat > "$SERVICE" <<EOF
 [Unit]
-Description=Voice Type - System-Level Voice Input (F9 Hotkey)
+Description=OkaWhisp - System-Level Voice Input (F9 Hotkey)
 After=graphical-session.target pipewire.service
 StartLimitBurst=3
 StartLimitIntervalSec=60s
@@ -104,24 +104,24 @@ MemoryHigh=3G
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=voice-type
+SyslogIdentifier=okawhisp
 
 [Install]
 WantedBy=graphical-session.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now voice-type.service
+systemctl --user enable --now okawhisp.service
 ok "Service installed and started"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}  ✓ voice-type installed!${NC}"
+echo -e "${GREEN}  ✓ okawhisp installed!${NC}"
 echo ""
 echo "  Press F9 to start recording."
 echo "  First start downloads the Whisper model (~1-3 GB) — be patient."
 echo ""
-echo "  Logs:    journalctl --user -u voice-type -f"
-echo "  Restart: systemctl --user restart voice-type"
-echo "  Config:  ~/.config/voice-type/config.toml"
+echo "  Logs:    journalctl --user -u okawhisp -f"
+echo "  Restart: systemctl --user restart okawhisp"
+echo "  Config:  ~/.config/okawhisp/config.toml"
 echo ""

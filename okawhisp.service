@@ -1,0 +1,31 @@
+[Unit]
+Description=OkaWhisp - System-Level Voice Input (F9 Hotkey)
+Documentation=file:///home/okahari/workspace/okawhisp/README.md
+After=graphical-session.target pipewire.service
+StartLimitBurst=3
+StartLimitIntervalSec=60s
+
+[Service]
+Type=simple
+ExecStart=/home/okahari/.local/bin/uv run /home/okahari/workspace/okawhisp/okawhisp.py --key F9 --model large-v3 --engine faster --language de --beam-size 5 --silence 2.0
+
+# X11 + Audio Zugriff
+Environment="DISPLAY=:1"
+Environment="XAUTHORITY=/home/okahari/.Xauthority"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="PYTHONUNBUFFERED=1"
+Environment="CUDA_VISIBLE_DEVICES=0"
+
+Restart=always
+RestartSec=5s
+
+# Ressourcen-Limits
+MemoryMax=4G
+MemoryHigh=3G
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=okawhisp
+
+[Install]
+WantedBy=graphical-session.target
