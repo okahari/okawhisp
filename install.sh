@@ -104,16 +104,6 @@ check_and_install "faster-whisper" "faster_whisper"
 check_and_install "silero-vad" "silero_vad"
 check_and_install "pynput"
 
-# Install hf_transfer for 3-5x faster HuggingFace downloads
-if ! python3 -c "import hf_transfer" 2>/dev/null; then
-    echo -n "  Installing hf_transfer for faster downloads... "
-    if pip install --user --break-system-packages hf_transfer >/dev/null 2>&1; then
-        echo -e "${GREEN}done${NC}"
-    else
-        echo -e "${YELLOW}skipped (optional)${NC}"
-    fi
-fi
-
 echo ""
 ok "Python dependencies ready"
 
@@ -200,7 +190,6 @@ Environment="XAUTHORITY=${XAUTH_VAL}"
 Environment="XDG_RUNTIME_DIR=/run/user/${UID_VAL}"
 Environment="PYTHONUNBUFFERED=1"
 Environment="CUDA_VISIBLE_DEVICES=0"
-Environment="HF_HUB_ENABLE_HF_TRANSFER=1"
 
 Restart=always
 RestartSec=5s
@@ -218,137 +207,65 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable okawhisp.service
 
-# ── 6. Download model BEFORE starting service ────────────────────────────────
-echo ""
-
-# Model sizes
-case "$WHISPER_MODEL" in
-    tiny)     MODEL_MB=75 ;;
-    base)     MODEL_MB=145 ;;
-    small)    MODEL_MB=470 ;;
-    medium)   MODEL_MB=1500 ;;
-    large-v3) MODEL_MB=3000 ;;
-    large)    MODEL_MB=3000 ;;
-    *)        MODEL_MB=1000 ;;
-esac
-
-info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB)..."
-echo ""
-
-# Map model name to repo name for cache dir
-case "$WHISPER_MODEL" in
-    large) MODEL_REPO_NAME="large-v3" ;;
-    *) MODEL_REPO_NAME="$WHISPER_MODEL" ;;
-esac
-
-MODEL_CACHE_DIR="$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-${MODEL_REPO_NAME}"
-
-# Python download script runs in background (with hf_transfer enabled)
-HF_HUB_ENABLE_HF_TRANSFER=1 WHISPER_MODEL="$WHISPER_MODEL" python3 << 'DOWNLOAD_SCRIPT' &
-import sys, os
-
-# Enable hf_transfer for faster downloads
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-
-from huggingface_hub import snapshot_download
-
-model_name = os.environ.get("WHISPER_MODEL", "small")
-repo_map = {
-    "tiny": "Systran/faster-whisper-tiny",
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large": "Systran/faster-whisper-large-v3",
-    "large-v3": "Systran/faster-whisper-large-v3",
-}
-cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-try:
-    snapshot_download(repo_id=repo_map.get(model_name, repo_map["small"]), cache_dir=cache_dir)
-    sys.exit(0)
-except Exception as e:
-    print(f"Download failed: {e}", file=sys.stderr)
-    sys.exit(1)
-DOWNLOAD_SCRIPT
-
-DOWNLOAD_PID=$!
-export WHISPER_MODEL
-
-# Monitor download progress
-SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-SPIN_IDX=0
-
-while kill -0 $DOWNLOAD_PID 2>/dev/null; do
-    # Check cache size
-    if [ -d "$MODEL_CACHE_DIR" ]; then
-        DOWNLOADED_KB=$(du -sk "$MODEL_CACHE_DIR" 2>/dev/null | cut -f1)
-        DOWNLOADED_MB=$((DOWNLOADED_KB / 1024))
-        PROGRESS=$((DOWNLOADED_MB * 100 / MODEL_MB))
-        [ $PROGRESS -gt 99 ] && PROGRESS=99
-    else
-        DOWNLOADED_MB=0
-        PROGRESS=0
-    fi
-    
-    # Draw progress bar
-    FILLED=$((PROGRESS / 5))
-    EMPTY=$((20 - FILLED))
-    BAR=$(printf "${GREEN}▓%.0s${NC}" $(seq 1 $FILLED))$(printf "░%.0s" $(seq 1 $EMPTY))
-    
-    SPIN_CHAR=$(echo "$SPINNER" | cut -c$((SPIN_IDX + 1)))
-    SPIN_IDX=$(( (SPIN_IDX + 1) % 10 ))
-    
-    echo -ne "\r  $SPIN_CHAR $BAR ${PROGRESS}% (${DOWNLOADED_MB}/${MODEL_MB} MB)"
-    
-    sleep 2
-done
-
-# Wait for download to finish
-wait $DOWNLOAD_PID
-DOWNLOAD_EXIT=$?
-
-echo -ne "\r\033[K"
-if [ $DOWNLOAD_EXIT -ne 0 ]; then
-    err "Model download failed"
-fi
-
-echo -e "  ${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC} 100%"
-ok "Model downloaded to cache"
-
-# ── 7. Now start service (model loads from cache instantly) ──────────────────
-echo ""
+# Force restart to apply new config (even if already running)
 if systemctl --user is-active --quiet okawhisp.service; then
-    info "Restarting service..."
+    info "Restarting service with new model config..."
     systemctl --user restart okawhisp.service
 else
     info "Starting service..."
     systemctl --user start okawhisp.service
 fi
 
-# Wait for service ready (should be fast - model is in cache)
-echo -n "  Waiting for service"
-MAX_WAIT=60
+# Wait for service to be ready (model loaded)
+echo ""
+
+# Estimate download time based on model size
+case "$WHISPER_MODEL" in
+    tiny)     ESTIMATED_SEC=10; MODEL_MB=75 ;;
+    base)     ESTIMATED_SEC=20; MODEL_MB=145 ;;
+    small)    ESTIMATED_SEC=60; MODEL_MB=470 ;;
+    medium)   ESTIMATED_SEC=120; MODEL_MB=1500 ;;
+    large-v3) ESTIMATED_SEC=240; MODEL_MB=3000 ;;
+    *)        ESTIMATED_SEC=120; MODEL_MB=1000 ;;
+esac
+
+info "Downloading Whisper model '${WHISPER_MODEL}' (~${MODEL_MB} MB, ~$((ESTIMATED_SEC / 60)) min)..."
+echo ""
+
+# Wait up to 10 minutes for model download + loading
+MAX_WAIT=600
 WAITED=0
 
+echo "  This may take several minutes depending on your connection and GPU..."
+echo ""
+
 while [ $WAITED -lt $MAX_WAIT ]; do
-    if journalctl --user -u okawhisp.service --since "1 minute ago" --no-pager 2>/dev/null | grep -qE "(Starte Hotkey-Listener|🎹 Hotkey: F9)"; then
-        echo -e "\r\033[K"
+    # Check if service is ready (look for hotkey messages in recent logs)
+    if journalctl --user -u okawhisp.service --since "5 minutes ago" --no-pager 2>/dev/null | grep -qE "(Starte Hotkey-Listener|🎹 Hotkey: F9)"; then
         ok "Service ready!"
         break
     fi
     
-    if ! systemctl --user is-active --quiet okawhisp.service; then
-        echo -e "\r\033[K"
-        err "Service crashed! Check: journalctl --user -u okawhisp -n 30"
+    # Check if service crashed
+    if systemctl --user is-failed --quiet okawhisp.service 2>/dev/null; then
+        echo ""
+        err "Service failed to start. Check logs: journalctl --user -u okawhisp -n 50"
     fi
     
-    echo -ne "\r  Waiting for service... ${WAITED}s"
-    sleep 1
-    WAITED=$((WAITED + 1))
+    # Simple progress dots
+    echo -n "."
+    sleep 5
+    WAITED=$((WAITED + 5))
 done
 
+echo ""
+
 if [ $WAITED -ge $MAX_WAIT ]; then
-    echo -e "\r\033[K"
-    warn "Service did not become ready. Check: journalctl --user -u okawhisp -f"
+    warn "Service did not become ready within ${MAX_WAIT}s"
+    warn "It may still be downloading the model in the background"
+    warn "Check status: journalctl --user -u okawhisp -f"
+else
+    echo ""
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
