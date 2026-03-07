@@ -45,15 +45,13 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 fi
 ok "System dependencies OK"
 
-# ── 2. uv ─────────────────────────────────────────────────────────────────────
-if ! command -v uv &>/dev/null && [ ! -f "$HOME/.local/bin/uv" ]; then
-    info "Installing uv (Python package manager)..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
+# ── 2. pip ────────────────────────────────────────────────────────────────────
+if ! python3 -m pip --version &>/dev/null; then
+    info "Installing pip..."
+    sudo apt-get install -y python3-pip 2>/dev/null \
+        || err "Could not install pip. Please install python3-pip manually."
 fi
-UV="${HOME}/.local/bin/uv"
-[ -f "$UV" ] || UV="$(command -v uv)"
-ok "uv ready: $UV"
+ok "pip ready"
 
 # ── 3. Download script ────────────────────────────────────────────────────────
 info "Installing okawhisp script..."
@@ -69,11 +67,30 @@ curl -sSL "$REPO/sounds/stop.mp3" -o "$INSTALL_DIR/sounds/stop.mp3"
 ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
 ok "Script installed to $INSTALL_DIR"
 
-# ── 4. Pre-warm dependencies (runs in background, first launch may be slow otherwise) ──
-info "Pre-installing Python dependencies (may take 1-5 min, downloads ~2GB with CUDA)..."
-"$UV" run --with faster-whisper --with silero-vad --with pyaudio --with numpy \
-    python3 -c "import faster_whisper, numpy, pyaudio; print('deps OK')" 2>/dev/null \
-    || info "Deps will be installed on first launch"
+# ── 4. Check Python dependencies ──────────────────────────────────────────────
+info "Checking Python dependencies..."
+MISSING_PY=()
+
+python3 -c "import torch" 2>/dev/null || MISSING_PY+=("torch")
+python3 -c "import faster_whisper" 2>/dev/null || MISSING_PY+=("faster-whisper")
+python3 -c "import numpy" 2>/dev/null || MISSING_PY+=("numpy")
+python3 -c "import pyaudio" 2>/dev/null || MISSING_PY+=("pyaudio")
+
+python3 -c "import silero_vad" 2>/dev/null || MISSING_PY+=("silero-vad")
+
+if [ ${#MISSING_PY[@]} -eq 0 ]; then
+    ok "All Python dependencies already installed"
+else
+    info "Installing missing Python packages: ${MISSING_PY[*]}"
+    info "This may take 1-5 min on first install (torch+CUDA ~2GB)"
+    
+    # Install via pip --user (uses system site-packages, no isolated env)
+    for pkg in "${MISSING_PY[@]}"; do
+        python3 -m pip install --user "$pkg" --quiet 2>/dev/null \
+            || info "Could not install $pkg - will be installed on first launch"
+    done
+    ok "Python dependencies installed"
+fi
 
 # ── 5. Systemd service ────────────────────────────────────────────────────────
 info "Installing systemd service..."
@@ -93,7 +110,7 @@ StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=${UV} run ${SCRIPT} --key F9 --model large-v3 --engine faster --language de --beam-size 5 --silence 2.0
+ExecStart=/usr/bin/python3 ${SCRIPT} --key F9 --model large-v3 --engine faster --language de --beam-size 5 --silence 2.0
 
 Environment="DISPLAY=${DISPLAY_VAL}"
 Environment="XAUTHORITY=${XAUTH_VAL}"
