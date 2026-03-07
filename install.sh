@@ -123,10 +123,10 @@ fi
 
 # Recommend model based on VRAM (default to small for fast install)
 if [ $VRAM_GB -ge 8 ]; then
-    RECOMMENDED="large"
+    RECOMMENDED="medium"
     REASON="(8+ GB VRAM - best quality)"
 elif [ $VRAM_GB -ge 6 ]; then
-    RECOMMENDED="large"
+    RECOMMENDED="small"
     REASON="(6-8 GB VRAM - good quality)"
 elif [ $VRAM_GB -ge 4 ]; then
     RECOMMENDED="large"
