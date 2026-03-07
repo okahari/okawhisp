@@ -348,46 +348,29 @@ EOF
             systemctl --user start okawhisp.service
         fi
 
-        # Wait for ready signal — ONLY check logs written AFTER we started the service
+        # Stream live service output until ready signal is found (or timeout)
         echo ""
-        info "Waiting for service to become ready (model download may take several minutes)..."
-        MAX_WAIT=600
-        WAITED=0
-        READY=0
+        info "Loading model — live output (large-v3 takes ~2-4 min on first start):"
+        echo ""
 
-        while [ "$WAITED" -lt "$MAX_WAIT" ]; do
-            # Match "ready" signal in logs newer than our start timestamp
-            if journalctl --user -u okawhisp.service \
-                    --since "$START_TIME" --no-pager 2>/dev/null \
-                    | grep -qiE "(hotkey|ready|listening|starte)"; then
-                READY=1
-                break
-            fi
-
-            # Detect early failure — no point waiting further
-            if ! systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
-                echo ""
-                warn "Service exited unexpectedly. Recent logs:"
-                echo ""
-                journalctl --user -u okawhisp.service \
-                    --since "$START_TIME" --no-pager -n 20 2>/dev/null || true
-                echo ""
-                warn "Fix the issue, then run: systemctl --user start okawhisp"
-                break
-            fi
-
-            printf "."
-            sleep 2
-            WAITED=$((WAITED + 2))
-        done
+        EXIT_CODE=0
+        timeout 600 bash -c '
+            journalctl --user -u okawhisp.service \
+                --since "'"$START_TIME"'" -f -o cat 2>/dev/null | \
+            while IFS= read -r line; do
+                printf "  %s\n" "$line"
+                if printf "%s\n" "$line" | grep -qiE "(Starte Hotkey|🎹|Hotkey listener|bereit|ready|listening)"; then
+                    exit 0
+                fi
+            done
+        ' || EXIT_CODE=$?
 
         echo ""
-        if [ "$READY" -eq 1 ]; then
-            ok "Service is ready!"
-        elif systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
-            warn "Service is running but did not signal ready within ${MAX_WAIT}s."
-            warn "It may still be initializing. Check: journalctl --user -u okawhisp -f"
-        fi
+        case "$EXIT_CODE" in
+            0)   ok "Service ready! Press F9 to record." ;;
+            124) warn "Timeout after 10 min. Check: journalctl --user -u okawhisp -f" ;;
+            *)   warn "Service stopped. Check: journalctl --user -u okawhisp -f" ;;
+        esac
     fi
 
 elif [ "$PLATFORM" = "macos" ]; then
