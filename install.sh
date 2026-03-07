@@ -222,7 +222,7 @@ echo ""
 info "Downloading Whisper model '${WHISPER_MODEL}'..."
 echo ""
 
-python3 << 'DOWNLOAD_SCRIPT'
+WHISPER_MODEL="$WHISPER_MODEL" python3 << 'DOWNLOAD_SCRIPT'
 import sys
 import os
 from huggingface_hub import snapshot_download
