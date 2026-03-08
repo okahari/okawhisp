@@ -40,6 +40,9 @@ sink_level = 10    # target volume % (10 = quiet, 30 = still audible)
 # ── Extended Watch / Actions (MVP) ─────────────────────────────
 [watch]
 idle_auto_close_seconds = 60
+rms_threshold = 10
+max_segment_ms = 10000
+intent_idle_ms = 1400
 
 [transcription]
 chunk_window_ms = 1200

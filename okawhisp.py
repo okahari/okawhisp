@@ -225,6 +225,8 @@ WATCH_CHUNK_WINDOW_MS = 1200
 WATCH_CHUNK_HOP_MS = 300
 WATCH_PARTIAL_FLUSH_MS = 1500
 WATCH_RMS_THRESHOLD = 30
+WATCH_MAX_SEGMENT_MS = 10000
+WATCH_INTENT_IDLE_MS = 1400
 _watch_thread = None
 WATCH_SUSPENDED = False
 
@@ -1302,11 +1304,8 @@ def _handle_actions_for_transcript(text, source="record"):
     # Build payload by removing matched trigger phrase from transcript.
     payload = raw
     if name == "type_to_telegram":
-        m = re.search(r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b\s*[:,.-]*\s*(.*)$", raw, flags=re.IGNORECASE)
-        if not m:
-            m = re.search(r"\b(?:go\s+to|open)\b\s*\btelegramm?\b\s*[:,.-]*\s*(.*)$", raw, flags=re.IGNORECASE)
-        if m:
-            payload = (m.group(1) or "").strip()
+        cmd_pattern = r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b|\b(?:go\s+to|open)\b\s*\btelegramm?\b"
+        payload = re.sub(cmd_pattern, "", raw, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
         # Do not fire if only command words were recognized.
         if not payload:
             log.debug(f"  [action:{source}] telegram intent found but payload empty")
@@ -1446,26 +1445,91 @@ def _start_control_server():
 
 
 def _watch_loop():
-    """Background watch listener: builds rolling chunks and runs action triggers without hotkey."""
+    """Background watch listener with segment-final trigger execution.
+
+    Phase A: Build speech segments from live chunks and finalize on silence.
+    Phase B: Detect intent, then collect follow-up text until idle.
+    Phase C: Execute action once on finalized collected text.
+    """
     global WATCH_ACTIVE, WATCH_UNTIL_TS, _audio_stream
 
-    ring = []
-    watch_text_segments = []
-    window_samples = int((WATCH_CHUNK_WINDOW_MS / 1000.0) * SAMPLE_RATE)
-    max_ring = max(window_samples * 2, VAD_CHUNK_SAMPLES * 4)
+    silence_s = max(0.3, VAD_MIN_SILENCE_MS / 1000.0)
+    max_segment_s = max(2.0, WATCH_MAX_SEGMENT_MS / 1000.0)
+    intent_idle_s = max(0.6, WATCH_INTENT_IDLE_MS / 1000.0)
 
-    next_flush_ts = time.time() + (WATCH_PARTIAL_FLUSH_MS / 1000.0)
-    next_hop_ts = time.time()
+    pre_chunks = []
+    pre_max = 8  # ~256ms at 32ms chunks
+
+    in_segment = False
+    segment_frames = []
+    segment_start_ts = 0.0
     last_speech_ts = 0.0
 
+    intent = None  # {"trig":..., "phrase":..., "name":..., "collected":str, "last_update":ts}
+
+    def _transcribe_np(audio_np):
+        if engine_type == "api":
+            return transcribe_via_api(audio_np)
+        if engine_type == "faster":
+            return transcribe_faster_whisper(audio_np)
+        if model is None:
+            return "", ""
+        return transcribe_openai_whisper(audio_np)
+
+    def _append_to_intent(text, now_ts):
+        nonlocal intent
+        if intent is None:
+            return
+        intent["collected"] = (intent["collected"] + " " + text).strip()
+        intent["last_update"] = now_ts
+
+    def _finalize_intent_if_due(now_ts):
+        nonlocal intent
+        if intent is None:
+            return
+        if now_ts - intent["last_update"] < intent_idle_s:
+            return
+
+        full_text = intent.get("collected", "").strip()
+        trig = intent.get("trig")
+        name = intent.get("name", "<unnamed>")
+        if not full_text or not trig:
+            intent = None
+            return
+
+        # Build payload without keyword phrase (keep text before+after keyword).
+        payload = full_text
+        if name == "type_to_telegram":
+            cmd_pattern = r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b|\b(?:go\s+to|open)\b\s*\btelegramm?\b"
+            payload = re.sub(cmd_pattern, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
+        else:
+            phrase = intent.get("phrase")
+            if phrase and phrase != "__telegram_intent__":
+                idx = full_text.lower().find(phrase)
+                if idx >= 0:
+                    payload = (full_text[:idx] + full_text[idx + len(phrase):]).strip(" ,.!?;:-")
+
+        if not payload:
+            log.info(f"  [watch] finalize intent '{name}' skipped (empty payload)")
+            intent = None
+            return
+
+        ok, msg = _run_action_trigger(trig, payload, raw_text=full_text)
+        if ok:
+            log.info(f"  [action:watch-final] ✅ {name} | payload='{payload[:160]}'")
+        else:
+            log.warning(f"  [action:watch-final] ❌ {name}: {msg}")
+        intent = None
+
     while not should_exit:
-        # Respect explicit watch stop / duration expiry
-        if WATCH_UNTIL_TS and time.time() >= WATCH_UNTIL_TS:
+        now = time.time()
+
+        if WATCH_UNTIL_TS and now >= WATCH_UNTIL_TS:
             WATCH_ACTIVE = False
             WATCH_UNTIL_TS = None
 
-        # Only run watch when enabled and not actively recording via hotkey
         if (not WATCH_ACTIVE) or _recording_lock.locked() or WATCH_SUSPENDED:
+            _finalize_intent_if_due(now)
             time.sleep(0.05)
             continue
 
@@ -1477,79 +1541,69 @@ def _watch_loop():
 
             data = _audio_stream.read(VAD_CHUNK_SAMPLES, exception_on_overflow=False)
             chunk_i16 = np.frombuffer(data, dtype=np.int16)
-            ring.extend(chunk_i16.tolist())
-            if len(ring) > max_ring:
-                ring = ring[-max_ring:]
-
-            # Activity tracking (lightweight gate in watch mode)
             chunk_rms = get_rms(chunk_i16.tobytes())
-            if chunk_rms > WATCH_RMS_THRESHOLD:
-                last_speech_ts = time.time()
+            is_speech = chunk_rms > WATCH_RMS_THRESHOLD
 
-            now = time.time()
-            if now < next_hop_ts:
-                time.sleep(min(0.01, next_hop_ts - now))
-                continue
-            next_hop_ts = now + (WATCH_CHUNK_HOP_MS / 1000.0)
+            pre_chunks.append(data)
+            if len(pre_chunks) > pre_max:
+                pre_chunks = pre_chunks[-pre_max:]
 
-            if now < next_flush_ts:
-                continue
-            next_flush_ts = now + (WATCH_PARTIAL_FLUSH_MS / 1000.0)
+            if is_speech:
+                last_speech_ts = now
+                if not in_segment:
+                    in_segment = True
+                    segment_start_ts = now
+                    segment_frames = list(pre_chunks)
+                segment_frames.append(data)
+            elif in_segment:
+                segment_frames.append(data)
 
-            # Only flush if we heard recent speech
-            if last_speech_ts <= 0 or (now - last_speech_ts) > (VAD_MIN_SILENCE_MS / 1000.0):
-                continue
+            # finalize segment on silence or max duration
+            seg_elapsed = (now - segment_start_ts) if in_segment else 0.0
+            silence_elapsed = (now - last_speech_ts) if in_segment else 0.0
+            if in_segment and (silence_elapsed >= silence_s or seg_elapsed >= max_segment_s):
+                in_segment = False
+                if segment_frames:
+                    audio_data = b"".join(segment_frames)
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    segment_frames = []
 
-            if len(ring) < max(256, window_samples // 2):
-                continue
+                    try:
+                        text, _lang = _transcribe_np(audio_np)
+                    except Exception as ex:
+                        log.warning(f"  [watch] transcribe failed: {ex}")
+                        text = ""
 
-            window = np.array(ring[-window_samples:], dtype=np.int16) if len(ring) >= window_samples else np.array(ring, dtype=np.int16)
-            audio_np = window.astype(np.float32) / 32768.0
+                    text = (text or "").strip()
+                    if text:
+                        log.info(f"  [watch-final] 📝 {text[:180]}")
+                        # Start or extend intent collection
+                        if intent is None:
+                            trig, phrase = _match_trigger(text.lower(), source="watch")
+                            if trig is not None:
+                                intent = {
+                                    "trig": trig,
+                                    "phrase": phrase,
+                                    "name": trig.get("name", "<unnamed>"),
+                                    "collected": text,
+                                    "last_update": now,
+                                }
+                                log.info(f"  [watch-final] intent='{intent['name']}' detected")
+                        else:
+                            _append_to_intent(text, now)
+                            log.info(f"  [watch-final] intent collect += '{text[:120]}'")
 
-            try:
-                if engine_type == "api":
-                    text, _lang = transcribe_via_api(audio_np)
-                elif engine_type == "faster":
-                    text, _lang = transcribe_faster_whisper(audio_np)
-                else:
-                    if model is None:
-                        # openai model not loaded yet
-                        time.sleep(0.2)
-                        continue
-                    text, _lang = transcribe_openai_whisper(audio_np)
-            except Exception as ex:
-                log.warning(f"  [watch] transcribe failed: {ex}")
-                continue
-
-            text = (text or "").strip()
-            if not text:
-                continue
-
-            log.info(f"  [watch] 📝 {text[:160]}")
-
-            # Rolling context across partial watch chunks (last ~6s)
-            ts = time.time()
-            watch_text_segments.append((ts, text))
-            watch_text_segments = [(t, s) for (t, s) in watch_text_segments if ts - t <= 6.0]
-            combined_text = " ".join(s for (_t, s) in watch_text_segments).strip()
-            if combined_text:
-                log.debug(f"  [watch] buffer='{combined_text[:180]}'")
-
-            consumed = _handle_actions_for_transcript(combined_text or text, source="watch")
-            if consumed:
-                watch_text_segments.clear()
+            _finalize_intent_if_due(now)
 
         except Exception as ex:
             msg = str(ex)
             if "-9988" in msg or "Stream closed" in msg or "-9983" in msg:
-                # Recover from closed/stopped stream without spamming the log.
                 try:
                     if _audio_stream is not None:
                         try:
                             _audio_stream.close()
                         except Exception:
                             pass
-                    # force reopen on next loop
                     _audio_stream = None
                 except Exception:
                     pass
@@ -1978,6 +2032,7 @@ def main():
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
     global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS, WATCH_RMS_THRESHOLD
+    global WATCH_MAX_SEGMENT_MS, WATCH_INTENT_IDLE_MS
 
     # ── Config File laden (Defaults) ─────────────────────────────
     cfg = load_config()
@@ -2028,6 +2083,16 @@ def main():
     if watch_cfg.get("rms_threshold") is not None:
         try:
             WATCH_RMS_THRESHOLD = int(watch_cfg["rms_threshold"])
+        except Exception:
+            pass
+    if watch_cfg.get("max_segment_ms") is not None:
+        try:
+            WATCH_MAX_SEGMENT_MS = int(watch_cfg["max_segment_ms"])
+        except Exception:
+            pass
+    if watch_cfg.get("intent_idle_ms") is not None:
+        try:
+            WATCH_INTENT_IDLE_MS = int(watch_cfg["intent_idle_ms"])
         except Exception:
             pass
 
@@ -2108,7 +2173,7 @@ Config File: ~/.config/voice-type/config.toml
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
     log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
-    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD}")
+    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD} max_seg={WATCH_MAX_SEGMENT_MS}ms intent_idle={WATCH_INTENT_IDLE_MS}ms")
 
     # Signal Handler
     def signal_handler(sig, frame):
