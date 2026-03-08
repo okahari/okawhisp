@@ -191,12 +191,15 @@ _vad_model = None           # silero-vad Modell (loaded beim Start)
 _recording_lock = threading.Lock()
 _ptt_stop_requested = False  # PTT mode: stop when key released
 
-# Persistente PyAudio-Instanz und Stream — werden einmal beim Start erstellt.
-# Stream wird per stop_stream()/start_stream() an/abgeschaltet, nie geschlossen.
-# This keeps the Jabra BT SCO profile (Mic + Headset) persistently active in PipeWire
-# und verhindert den 4-5s Trenn/Reconnect-Zyklus der sonst alles blockiert.
+# Persistente PyAudio-Instanz; Stream wird bei Bedarf geöffnet/geschlossen.
+# Startet "warm" und wird nach Idle-Timeout wieder geschlossen (Privacy + GNOME mic indicator).
 _pyaudio_instance = None
 _audio_stream = None
+
+# Idle close policy (requested): 60s after app start and 60s after each recording stop.
+IDLE_CLOSE_SECONDS = 60
+_idle_close_timer = None
+_idle_timer_lock = threading.Lock()
 
 # ─── ALSA error suppression (once at startup) ──────────────
 # WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
@@ -1058,6 +1061,76 @@ def _check_mic_ready(max_wait_s: float = 3.0) -> bool:
     return False
 
 
+def _open_audio_stream():
+    """(Re)opens input stream when needed."""
+    global _pyaudio_instance, _audio_stream
+
+    if _pyaudio_instance is None:
+        _pyaudio_instance = pyaudio.PyAudio()
+
+    if _audio_stream is None:
+        _audio_stream = _pyaudio_instance.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        log.info(f"  ✅ Input stream opened | Device: {_mic_device_info()}")
+
+
+def _close_audio_stream(reason: str = "idle-timeout"):
+    """Closes input stream fully (removes active mic handle in PipeWire)."""
+    global _audio_stream
+
+    if _audio_stream is None:
+        return
+
+    try:
+        if _audio_stream.is_active():
+            _audio_stream.stop_stream()
+    except Exception:
+        pass
+
+    try:
+        _audio_stream.close()
+    except Exception as ex:
+        log.warning(f"  ⚠️  close_stream failed ({reason}): {ex}")
+    finally:
+        _audio_stream = None
+        log.info(f"  💤 Input stream closed ({reason})")
+
+
+def _cancel_idle_close_timer():
+    global _idle_close_timer
+    with _idle_timer_lock:
+        if _idle_close_timer is not None:
+            _idle_close_timer.cancel()
+            _idle_close_timer = None
+
+
+def _schedule_idle_close(seconds: int = IDLE_CLOSE_SECONDS, reason: str = "idle-timeout"):
+    """Schedules full stream close after inactivity."""
+    global _idle_close_timer
+
+    _cancel_idle_close_timer()
+
+    def _idle_close_task():
+        global _idle_close_timer
+        with _idle_timer_lock:
+            _idle_close_timer = None
+        if _recording_lock.locked():
+            _schedule_idle_close(seconds=seconds, reason=reason)
+            return
+        _close_audio_stream(reason=reason)
+
+    with _idle_timer_lock:
+        _idle_close_timer = threading.Timer(seconds, _idle_close_task)
+        _idle_close_timer.daemon = True
+        _idle_close_timer.start()
+    log.info(f"  ⏳ Idle close scheduled in {seconds}s ({reason})")
+
+
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """Hauptfunktion: Aufnehmen → Transcribingn → Typing
     
@@ -1082,6 +1155,7 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     finally:
         _ptt_stop_requested = False
         _recording_lock.release()
+        _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="post-record-idle")
         log.info("◀  Recording sequence finished")
         log.info("━" * 60)
 
@@ -1093,6 +1167,9 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     skip_start_sound: If True, start sound was already played externally.
     """
     global _audio_stream
+
+    _cancel_idle_close_timer()
+    _open_audio_stream()
 
     # ── 1. Stream-Status checkingn & starten ──────────────────────
     stream_active = _audio_stream.is_active() if _audio_stream else False
@@ -1645,23 +1722,15 @@ Config File: ~/.config/voice-type/config.toml
     print("─" * 60)
     print()
 
-    # PyAudio-Instanz + Stream einmalig erstellen und persistently halten.
-    # Stream wird per stop_stream()/start_stream() gesteuert, nie geschlossen.
-    # → Jabra-BT SCO-Profil bleibt in PipeWire registriert, kein 4-5s Reconnect.
+    # PyAudio-Instanz + Stream warm starten; nach 60s idle wieder schließen.
     global _pyaudio_instance, _audio_stream
     try:
-        _pyaudio_instance = pyaudio.PyAudio()
-        _audio_stream = _pyaudio_instance.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        _audio_stream.stop_stream()  # Sofort stoppen — bleibt aber in PipeWire active
+        _open_audio_stream()
+        _audio_stream.stop_stream()  # warm start, no active capture
         dev_info = _mic_device_info()
-        print(f"  ✅ PyAudio + Input-Stream initialisiert (persistent, ready)")
+        print(f"  ✅ PyAudio + Input-Stream initialisiert (warm start, idle-close={IDLE_CLOSE_SECONDS}s)")
         log.info(f"  ✅ PyAudio initialisiert | Input-Device: {dev_info}")
+        _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="startup-idle")
     except Exception as e:
         log.error(f"  ❌ Audio-Initialisierung failed: {e}")
         print(f"  ❌ Audio-Initialisierung failed: {e}")
@@ -1683,6 +1752,7 @@ Config File: ~/.config/voice-type/config.toml
         listen_xbindkeys_hotkey(args.key)
 
     # Cleanup beim Beenden
+    _cancel_idle_close_timer()
     if _audio_stream is not None:
         try:
             _audio_stream.close()
