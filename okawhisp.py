@@ -46,6 +46,7 @@ import logging
 import json
 import socket
 import shlex
+import re
 from pathlib import Path
 from datetime import datetime
 try:
@@ -211,11 +212,21 @@ WATCH_ACTIVE = True
 WATCH_UNTIL_TS = None
 
 ACTION_TRIGGERS = []
+ACTION_COOLDOWN_MS = 2500
+AUTO_PROMPT_FROM_TRIGGERS = True
+
+# Trigger matching guardrails
+CONTEXT_MATCH_WATCH_ONLY = True
+REQUIRE_COMMAND_PREFIX = True
+
+_trigger_last_fire = {}
 
 WATCH_CHUNK_WINDOW_MS = 1200
 WATCH_CHUNK_HOP_MS = 300
 WATCH_PARTIAL_FLUSH_MS = 1500
+WATCH_RMS_THRESHOLD = 30
 _watch_thread = None
+WATCH_SUSPENDED = False
 
 # ─── ALSA error suppression (once at startup) ──────────────
 # WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
@@ -1147,6 +1158,42 @@ def _schedule_idle_close(seconds: int = IDLE_CLOSE_SECONDS, reason: str = "idle-
     log.info(f"  ⏳ Idle close scheduled in {seconds}s ({reason})")
 
 
+def _build_trigger_prompt_terms():
+    terms = []
+    for trig in ACTION_TRIGGERS:
+        for phrase in trig.get("match", []):
+            p = str(phrase).strip()
+            if p:
+                terms.append(p)
+    # stable unique order
+    seen = set()
+    uniq = []
+    for t in terms:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(t)
+    return uniq
+
+
+def _apply_auto_prompt_from_triggers():
+    """Inject trigger keywords into INITIAL_PROMPT so ASR is biased towards command phrases."""
+    global INITIAL_PROMPT
+    if not AUTO_PROMPT_FROM_TRIGGERS:
+        return
+    terms = _build_trigger_prompt_terms()
+    if not terms:
+        return
+
+    auto_prompt = "voice commands: " + ", ".join(terms)
+    if INITIAL_PROMPT and str(INITIAL_PROMPT).strip():
+        INITIAL_PROMPT = f"{INITIAL_PROMPT.strip()} | {auto_prompt}"
+    else:
+        INITIAL_PROMPT = auto_prompt
+    log.info(f"  ⚙️  prompt auto-augmented from {len(terms)} trigger keywords")
+
+
 def _parse_duration_to_seconds(raw):
     """Parses strings like 5m, 60s, 1h into seconds."""
     if raw is None:
@@ -1178,13 +1225,27 @@ def _watch_set_duration(duration_raw):
     return True, f"watch duration set/extended by {duration_raw}"
 
 
-def _match_trigger(text_lower):
+def _match_trigger(text_lower, source="record"):
     for trig in ACTION_TRIGGERS:
+        name = trig.get("name", "")
+
+        # Context-aware English-only matching for telegram action.
+        if name == "type_to_telegram":
+            allow_context = not (CONTEXT_MATCH_WATCH_ONLY and source != "watch")
+            if allow_context:
+                has_target = bool(re.search(r"\btelegramm?\b", text_lower))
+                if REQUIRE_COMMAND_PREFIX:
+                    has_verb = bool(re.search(r"^\s*(?:send|type|write|go\s+to|open)\b", text_lower))
+                else:
+                    has_verb = bool(re.search(r"\b(send|type|write|go\s+to|open)\b", text_lower))
+                if has_target and has_verb:
+                    return trig, "__telegram_intent__"
+
         for phrase in trig.get("match", []):
             p = str(phrase).strip().lower()
             if p and p in text_lower:
-                return trig
-    return None
+                return trig, p
+    return None, None
 
 
 def _run_action_trigger(trig, text, raw_text=None):
@@ -1217,21 +1278,54 @@ def _run_action_trigger(trig, text, raw_text=None):
         return False, str(ex)
 
 
-def _handle_actions_for_transcript(text):
+def _handle_actions_for_transcript(text, source="record"):
     """Matches and executes first action trigger. Returns True if action consumed output."""
     if not ACTION_TRIGGERS:
         return False
     raw = text or ""
     text_lower = raw.lower()
-    trig = _match_trigger(text_lower)
+    trig, phrase = _match_trigger(text_lower, source=source)
     if not trig:
+        log.debug(f"  [action:{source}] no trigger match for: {raw[:120]}")
         return False
+
     name = trig.get("name", "<unnamed>")
-    ok, msg = _run_action_trigger(trig, raw, raw_text=raw)
+
+    # Global + per-trigger cooldown
+    now = time.time()
+    last = _trigger_last_fire.get(name, 0.0)
+    trig_cd_ms = int(trig.get("cooldown_ms", ACTION_COOLDOWN_MS)) if str(trig.get("cooldown_ms", "")).strip() else ACTION_COOLDOWN_MS
+    if (now - last) * 1000.0 < trig_cd_ms:
+        log.debug(f"  [action:{source}] cooldown skip for '{name}' ({trig_cd_ms}ms)")
+        return False
+
+    # Build payload by removing matched trigger phrase from transcript.
+    payload = raw
+    if name == "type_to_telegram":
+        m = re.search(r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b\s*[:,.-]*\s*(.*)$", raw, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(?:go\s+to|open)\b\s*\btelegramm?\b\s*[:,.-]*\s*(.*)$", raw, flags=re.IGNORECASE)
+        if m:
+            payload = (m.group(1) or "").strip()
+        # Do not fire if only command words were recognized.
+        if not payload:
+            log.debug(f"  [action:{source}] telegram intent found but payload empty")
+            return False
+    else:
+        if phrase and phrase != "__telegram_intent__":
+            idx = text_lower.find(phrase)
+            if idx >= 0:
+                payload = (raw[:idx] + raw[idx + len(phrase):]).strip(" ,.!?;:-")
+        if not payload:
+            payload = raw
+
+    log.info(f"  [action:{source}] match → {name} | phrase='{phrase}' | payload='{payload[:120]}'")
+    ok, msg = _run_action_trigger(trig, payload, raw_text=raw)
     if ok:
-        log.info(f"  [action] ✅ Trigger '{name}' executed")
+        _trigger_last_fire[name] = now
+        log.info(f"  [action:{source}] ✅ Trigger '{name}' executed")
         return True
-    log.warning(f"  [action] ❌ Trigger '{name}' failed: {msg}")
+    log.warning(f"  [action:{source}] ❌ Trigger '{name}' failed: {msg}")
     return False
 
 
@@ -1353,9 +1447,10 @@ def _start_control_server():
 
 def _watch_loop():
     """Background watch listener: builds rolling chunks and runs action triggers without hotkey."""
-    global WATCH_ACTIVE, WATCH_UNTIL_TS
+    global WATCH_ACTIVE, WATCH_UNTIL_TS, _audio_stream
 
     ring = []
+    watch_text_segments = []
     window_samples = int((WATCH_CHUNK_WINDOW_MS / 1000.0) * SAMPLE_RATE)
     max_ring = max(window_samples * 2, VAD_CHUNK_SAMPLES * 4)
 
@@ -1370,12 +1465,7 @@ def _watch_loop():
             WATCH_UNTIL_TS = None
 
         # Only run watch when enabled and not actively recording via hotkey
-        if not WATCH_ACTIVE or _recording_lock.locked():
-            try:
-                if _audio_stream is not None and _audio_stream.is_active():
-                    _audio_stream.stop_stream()
-            except Exception:
-                pass
+        if (not WATCH_ACTIVE) or _recording_lock.locked() or WATCH_SUSPENDED:
             time.sleep(0.05)
             continue
 
@@ -1392,7 +1482,8 @@ def _watch_loop():
                 ring = ring[-max_ring:]
 
             # Activity tracking (lightweight gate in watch mode)
-            if get_rms(chunk_i16.tobytes()) > SILENCE_THRESHOLD:
+            chunk_rms = get_rms(chunk_i16.tobytes())
+            if chunk_rms > WATCH_RMS_THRESHOLD:
                 last_speech_ts = time.time()
 
             now = time.time()
@@ -1421,6 +1512,10 @@ def _watch_loop():
                 elif engine_type == "faster":
                     text, _lang = transcribe_faster_whisper(audio_np)
                 else:
+                    if model is None:
+                        # openai model not loaded yet
+                        time.sleep(0.2)
+                        continue
                     text, _lang = transcribe_openai_whisper(audio_np)
             except Exception as ex:
                 log.warning(f"  [watch] transcribe failed: {ex}")
@@ -1430,9 +1525,37 @@ def _watch_loop():
             if not text:
                 continue
 
-            _handle_actions_for_transcript(text)
+            log.info(f"  [watch] 📝 {text[:160]}")
+
+            # Rolling context across partial watch chunks (last ~6s)
+            ts = time.time()
+            watch_text_segments.append((ts, text))
+            watch_text_segments = [(t, s) for (t, s) in watch_text_segments if ts - t <= 6.0]
+            combined_text = " ".join(s for (_t, s) in watch_text_segments).strip()
+            if combined_text:
+                log.debug(f"  [watch] buffer='{combined_text[:180]}'")
+
+            consumed = _handle_actions_for_transcript(combined_text or text, source="watch")
+            if consumed:
+                watch_text_segments.clear()
 
         except Exception as ex:
+            msg = str(ex)
+            if "-9988" in msg or "Stream closed" in msg or "-9983" in msg:
+                # Recover from closed/stopped stream without spamming the log.
+                try:
+                    if _audio_stream is not None:
+                        try:
+                            _audio_stream.close()
+                        except Exception:
+                            pass
+                    # force reopen on next loop
+                    _audio_stream = None
+                except Exception:
+                    pass
+                log.warning("  [watch] stream closed -> recovering")
+                time.sleep(0.35)
+                continue
             log.warning(f"  [watch] loop error: {ex}")
             time.sleep(0.2)
 
@@ -1449,7 +1572,7 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     ptt_mode: If True, Push-to-Talk mode (stop on key release, send with Enter)
     skip_start_sound: If True, start sound was already played (PTT mode)
     """
-    global _ptt_stop_requested
+    global _ptt_stop_requested, WATCH_SUSPENDED
 
     # Lock statt bool: verhindert Race-Condition bei schnell-mehrfachem Hotkey
     if not _recording_lock.acquire(blocking=False):
@@ -1458,6 +1581,7 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
     # Reset PTT stop flag
     _ptt_stop_requested = False
+    WATCH_SUSPENDED = True
     
     mode_str = "PTT" if ptt_mode else "Toggle"
     log.info("━" * 60)
@@ -1466,6 +1590,7 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         _run_voice_input(ptt_mode=ptt_mode, skip_start_sound=skip_start_sound)
     finally:
         _ptt_stop_requested = False
+        WATCH_SUSPENDED = False
         _recording_lock.release()
         _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="post-record-idle")
         log.info("◀  Recording sequence finished")
@@ -1660,7 +1785,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     log.info(f"  [7] 📝 [{lang}] ({elapsed_trans:.1f}s) {text}")
 
     # ── 7b. Action triggers (recording + watch) ────────────────
-    action_consumed = _handle_actions_for_transcript(text)
+    action_consumed = _handle_actions_for_transcript(text, source="record")
     if action_consumed:
         notify("✅ Action", text[:80])
         log.info("  [7b] Action consumed transcript (skip default typing)")
@@ -1722,9 +1847,8 @@ def listen_keyboard_hotkey(hotkey):
             65312,  # 0xFF20 = XK_Multi_key (Compose, sometimes used)
             65511,  # 0xFFE7 = XK_Meta_L (rare)
             65512,  # 0xFFE8 = XK_Meta_R (rare)
-            65513,  # 0xFFE9 = XK_Alt_L 
+            65513,  # 0xFFE9 = XK_Alt_L
             65514,  # 0xFFEA = XK_Alt_R (alternative)
-            108,    # Some systems report raw keycode 108 for AltGr
         }
         is_altgr_hotkey = hotkey_norm in ('ALT_GR', 'ALTGR', 'RIGHT_ALT', 'RALT')
         
@@ -1772,10 +1896,19 @@ def listen_keyboard_hotkey(hotkey):
                         # Still held after threshold → PTT mode
                         ptt_state['ptt_active'] = True
                         log.info("▶  PTT mode — Recording while key held")
-                        # Play start sound IMMEDIATELY
-                        play_sound("record_start", volume_boost=SOUND_VOLUME_BOOST)
-                        thread = threading.Thread(target=lambda: do_voice_input(ptt_mode=True, skip_start_sound=True), daemon=True)
+
+                        # Start recording FIRST to avoid clipping first spoken words.
+                        thread = threading.Thread(
+                            target=lambda: do_voice_input(ptt_mode=True, skip_start_sound=True),
+                            daemon=True,
+                        )
                         thread.start()
+
+                        # Optional UX chime after recording has started (non-blocking).
+                        def _late_ptt_chime():
+                            time.sleep(0.08)
+                            play_sound("record_start", volume_boost=SOUND_VOLUME_BOOST)
+                        threading.Thread(target=_late_ptt_chime, daemon=True).start()
                 
                 threading.Thread(target=check_ptt, daemon=True).start()
 
@@ -1843,8 +1976,8 @@ def main():
     global DUCK_AUDIO_DURING_RECORDING, DUCK_SINK_LEVEL
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
-    global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, WATCH_ACTIVE
-    global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS
+    global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
+    global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS, WATCH_RMS_THRESHOLD
 
     # ── Config File laden (Defaults) ─────────────────────────────
     cfg = load_config()
@@ -1891,6 +2024,20 @@ def main():
             WATCH_PARTIAL_FLUSH_MS = int(trans_cfg["partial_flush_ms"])
         except Exception:
             pass
+
+    if watch_cfg.get("rms_threshold") is not None:
+        try:
+            WATCH_RMS_THRESHOLD = int(watch_cfg["rms_threshold"])
+        except Exception:
+            pass
+
+    if actions_cfg.get("action_cooldown_ms") is not None:
+        try:
+            ACTION_COOLDOWN_MS = int(actions_cfg["action_cooldown_ms"])
+        except Exception:
+            pass
+    if actions_cfg.get("auto_prompt_from_triggers") is not None:
+        AUTO_PROMPT_FROM_TRIGGERS = bool(actions_cfg.get("auto_prompt_from_triggers"))
 
     ACTION_TRIGGERS = actions_cfg.get("triggers", []) if isinstance(actions_cfg.get("triggers", []), list) else []
 
@@ -1944,6 +2091,8 @@ Config File: ~/.config/voice-type/config.toml
     SILENCE_THRESHOLD = args.threshold
     engine_type = args.engine
 
+    _apply_auto_prompt_from_triggers()
+
     # API configuration (CLI overrides config file)
     if args.api_url:   WHISPER_API_BASE_URL = args.api_url
     if args.api_key:   WHISPER_API_KEY      = args.api_key
@@ -1959,7 +2108,7 @@ Config File: ~/.config/voice-type/config.toml
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
     log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
-    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms")
+    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD}")
 
     # Signal Handler
     def signal_handler(sig, frame):

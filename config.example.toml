@@ -52,6 +52,7 @@ action_cooldown_ms = 3000
 same_keyword_rearm_ms = 5000
 mode_switch_grace_ms = 500
 
+
 [[actions.triggers]]
 name = "extend_watch_5m"
 match = ["keep listening", "extend watch"]
