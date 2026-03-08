@@ -1,5 +1,5 @@
-# voice-type configuration
-# Copy to: ~/.config/voice-type/config.toml
+# okawhisp configuration
+# Copy to: ~/.config/okawhisp/config.toml
 # All settings are optional — CLI arguments always override these values.
 
 [recording]
@@ -36,3 +36,30 @@ sink_level = 10    # target volume % (10 = quiet, 30 = still audible)
 # base_url = "https://api.groq.com/openai/v1"
 # api_key  = "gsk_your_key_here"   # or set OPENAI_API_KEY env var
 # model    = "whisper-large-v3"
+
+# ── Extended Watch / Actions (MVP) ─────────────────────────────
+[watch]
+idle_auto_close_seconds = 60
+
+[transcription]
+chunk_window_ms = 1200
+chunk_hop_ms = 300
+partial_flush_ms = 1500
+
+[actions]
+keyword_debounce_ms = 1200
+action_cooldown_ms = 3000
+same_keyword_rearm_ms = 5000
+mode_switch_grace_ms = 500
+
+[[actions.triggers]]
+name = "extend_watch_5m"
+match = ["keep listening", "extend watch"]
+command = "okawhispctl"
+args = ["watch", "duration", "5m"]
+
+[[actions.triggers]]
+name = "type_to_telegram"
+match = ["type to telegram", "send to telegram"]
+command = "/bin/bash"
+args = ["-lc", "WID=$(xdotool search --class TelegramDesktop | head -n1); xdotool windowactivate --sync \"$WID\" && xdotool type --delay 5 --clearmodifiers \"$OKAWISP_TEXT\""]

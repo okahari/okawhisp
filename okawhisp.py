@@ -43,6 +43,9 @@ import os
 import io
 import wave
 import logging
+import json
+import socket
+import shlex
 from pathlib import Path
 from datetime import datetime
 try:
@@ -200,6 +203,14 @@ _audio_stream = None
 IDLE_CLOSE_SECONDS = 60
 _idle_close_timer = None
 _idle_timer_lock = threading.Lock()
+
+CONTROL_SOCKET_PATH = str(Path.home() / ".local" / "share" / "okawhisp" / "control.sock")
+_control_server_thread = None
+
+WATCH_ACTIVE = True
+WATCH_UNTIL_TS = None
+
+ACTION_TRIGGERS = []
 
 # ─── ALSA error suppression (once at startup) ──────────────
 # WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
@@ -1131,6 +1142,210 @@ def _schedule_idle_close(seconds: int = IDLE_CLOSE_SECONDS, reason: str = "idle-
     log.info(f"  ⏳ Idle close scheduled in {seconds}s ({reason})")
 
 
+def _parse_duration_to_seconds(raw):
+    """Parses strings like 5m, 60s, 1h into seconds."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    units = {'s': 1, 'm': 60, 'h': 3600}
+    unit = s[-1]
+    if unit in units:
+        try:
+            return int(float(s[:-1]) * units[unit])
+        except ValueError:
+            return None
+    return None
+
+
+def _watch_set_duration(duration_raw):
+    global WATCH_UNTIL_TS, WATCH_ACTIVE
+    sec = _parse_duration_to_seconds(duration_raw)
+    if sec is None or sec < 0:
+        return False, f"invalid duration: {duration_raw}"
+    WATCH_ACTIVE = sec > 0
+    WATCH_UNTIL_TS = (time.time() + sec) if sec > 0 else None
+    return True, f"watch duration set/extended by {duration_raw}"
+
+
+def _match_trigger(text_lower):
+    for trig in ACTION_TRIGGERS:
+        for phrase in trig.get("match", []):
+            p = str(phrase).strip().lower()
+            if p and p in text_lower:
+                return trig
+    return None
+
+
+def _run_action_trigger(trig, text, raw_text=None):
+    command = trig.get("command")
+    args = [str(a) for a in trig.get("args", [])]
+    if not command:
+        return False, "trigger has no command"
+
+    env = os.environ.copy()
+    env["OKAWISP_TEXT"] = text or ""
+    env["OKAWISP_TEXT_RAW"] = raw_text if raw_text is not None else (text or "")
+    env["OKAWISP_TRIGGER"] = trig.get("name", "")
+
+    min_chars = trig.get("min_chars")
+    if isinstance(min_chars, int) and len((text or "").strip()) < min_chars:
+        return False, f"min_chars not reached ({min_chars})"
+
+    try:
+        proc = subprocess.run([command, *args], env=env, capture_output=True, text=True, timeout=20)
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if out:
+            log.info(f"  [action] stdout: {out}")
+        if err:
+            log.warning(f"  [action] stderr: {err}")
+        if proc.returncode != 0:
+            return False, f"exit={proc.returncode}"
+        return True, "ok"
+    except Exception as ex:
+        return False, str(ex)
+
+
+def _handle_actions_for_transcript(text):
+    """Matches and executes first action trigger. Returns True if action consumed output."""
+    if not ACTION_TRIGGERS:
+        return False
+    raw = text or ""
+    text_lower = raw.lower()
+    trig = _match_trigger(text_lower)
+    if not trig:
+        return False
+    name = trig.get("name", "<unnamed>")
+    ok, msg = _run_action_trigger(trig, raw, raw_text=raw)
+    if ok:
+        log.info(f"  [action] ✅ Trigger '{name}' executed")
+        return True
+    log.warning(f"  [action] ❌ Trigger '{name}' failed: {msg}")
+    return False
+
+
+def _build_status_payload():
+    now = time.time()
+    watch_remaining = None
+    if WATCH_UNTIL_TS:
+        watch_remaining = max(0, int(WATCH_UNTIL_TS - now))
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "recording": _recording_lock.locked(),
+        "watch_active": WATCH_ACTIVE,
+        "watch_remaining_s": watch_remaining,
+        "idle_auto_close_seconds": IDLE_CLOSE_SECONDS,
+        "control_socket": CONTROL_SOCKET_PATH,
+    }
+
+
+def _handle_control_request(req):
+    global IDLE_CLOSE_SECONDS, WATCH_ACTIVE, WATCH_UNTIL_TS
+
+    op = req.get("op")
+    if op == "status":
+        return _build_status_payload()
+
+    if op == "watch.start":
+        WATCH_ACTIVE = True
+        WATCH_UNTIL_TS = None
+        return {"ok": True, "message": "watch started"}
+
+    if op == "watch.stop":
+        WATCH_ACTIVE = False
+        WATCH_UNTIL_TS = None
+        return {"ok": True, "message": "watch stopped"}
+
+    if op == "watch.duration":
+        ok, msg = _watch_set_duration(req.get("duration"))
+        return {"ok": ok, "message": msg}
+
+    if op == "watch.set_idle_close":
+        sec = _parse_duration_to_seconds(req.get("idle_close"))
+        if sec is None or sec < 0:
+            return {"ok": False, "message": "invalid idle_close"}
+        IDLE_CLOSE_SECONDS = sec
+        return {"ok": True, "message": f"idle_auto_close_seconds={sec}"}
+
+    if op == "test.trigger":
+        name = req.get("name")
+        text = req.get("text", "")
+        trig = None
+        for t in ACTION_TRIGGERS:
+            if t.get("name") == name:
+                trig = t
+                break
+        if trig is None:
+            return {"ok": False, "message": f"trigger not found: {name}"}
+        ok, msg = _run_action_trigger(trig, text, raw_text=text)
+        return {"ok": ok, "message": msg, "trigger": name}
+
+    return {"ok": False, "message": f"unknown op: {op}"}
+
+
+def _control_server_loop():
+    os.makedirs(os.path.dirname(CONTROL_SOCKET_PATH), exist_ok=True)
+    if os.path.exists(CONTROL_SOCKET_PATH):
+        try:
+            os.remove(CONTROL_SOCKET_PATH)
+        except Exception:
+            pass
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(CONTROL_SOCKET_PATH)
+    os.chmod(CONTROL_SOCKET_PATH, 0o600)
+    srv.listen(16)
+    srv.settimeout(1.0)
+
+    log.info(f"  🔌 Control socket listening: {CONTROL_SOCKET_PATH}")
+
+    def _handle_conn(conn):
+        with conn:
+            try:
+                data = conn.recv(65536)
+                req = json.loads(data.decode("utf-8", errors="ignore") or "{}")
+                resp = _handle_control_request(req)
+            except Exception as ex:
+                resp = {"ok": False, "message": str(ex)}
+            try:
+                conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+    try:
+        while not should_exit:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+            threading.Thread(target=_handle_conn, args=(conn,), daemon=True).start()
+    finally:
+        try:
+            srv.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(CONTROL_SOCKET_PATH):
+                os.remove(CONTROL_SOCKET_PATH)
+        except Exception:
+            pass
+
+
+def _start_control_server():
+    global _control_server_thread
+    _control_server_thread = threading.Thread(target=_control_server_loop, daemon=True)
+    _control_server_thread.start()
+
+
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """Hauptfunktion: Aufnehmen → Transcribingn → Typing
     
@@ -1347,6 +1562,13 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
     log.info(f"  [7] 📝 [{lang}] ({elapsed_trans:.1f}s) {text}")
 
+    # ── 7b. Action triggers (recording + watch) ────────────────
+    action_consumed = _handle_actions_for_transcript(text)
+    if action_consumed:
+        notify("✅ Action", text[:80])
+        log.info("  [7b] Action consumed transcript (skip default typing)")
+        return
+
     # ── 8. Type text into active window ─────────────────────────
     time.sleep(0.3)
     typed = type_text(text)
@@ -1524,6 +1746,7 @@ def main():
     global DUCK_AUDIO_DURING_RECORDING, DUCK_SINK_LEVEL
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
+    global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, WATCH_ACTIVE
 
     # ── Config File laden (Defaults) ─────────────────────────────
     cfg = load_config()
@@ -1532,6 +1755,8 @@ def main():
     duck = cfg.get("duck", {})
     sounds = cfg.get("sounds", {})
     api_cfg = cfg.get("api", {})
+    watch_cfg = cfg.get("watch", {})
+    actions_cfg = cfg.get("actions", {})
 
     # Config values as defaults (CLI overrides these)
     if vad.get("enabled") is not None:    VAD_ENABLED        = vad["enabled"]
@@ -1544,6 +1769,15 @@ def main():
     if api_cfg.get("base_url"):           WHISPER_API_BASE_URL = api_cfg["base_url"]
     if api_cfg.get("api_key"):            WHISPER_API_KEY      = api_cfg["api_key"]
     if api_cfg.get("model"):              WHISPER_API_MODEL    = api_cfg["model"]
+
+    if watch_cfg.get("idle_auto_close_seconds") is not None:
+        try:
+            IDLE_CLOSE_SECONDS = int(watch_cfg["idle_auto_close_seconds"])
+        except Exception:
+            pass
+    WATCH_ACTIVE = IDLE_CLOSE_SECONDS > 0
+
+    ACTION_TRIGGERS = actions_cfg.get("triggers", []) if isinstance(actions_cfg.get("triggers", []), list) else []
 
     parser = argparse.ArgumentParser(
         description='OkaWhisp - System-Level Voice Input',
@@ -1609,6 +1843,7 @@ Config File: ~/.config/voice-type/config.toml
     log.info("🎤 OkaWhisp gestarting")
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
+    log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
 
     # Signal Handler
     def signal_handler(sig, frame):
@@ -1619,6 +1854,9 @@ Config File: ~/.config/voice-type/config.toml
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Control socket (okawhispctl)
+    _start_control_server()
 
     # GPU checkingn
     device = "cpu"
