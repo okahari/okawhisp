@@ -227,8 +227,25 @@ WATCH_PARTIAL_FLUSH_MS = 1500
 WATCH_RMS_THRESHOLD = 30
 WATCH_MAX_SEGMENT_MS = 10000
 WATCH_INTENT_IDLE_MS = 1400
+WATCH_SILENCE_MS     = 1200  # Silence after last speech to end a watch segment
 _watch_thread = None
 WATCH_SUSPENDED = False
+
+# ─── Trigger payload-extraction patterns (shared across watch + record paths) ──
+# Removing the command phrase before typing the remaining text.
+_PAT_TYPE_TO_ACTIVE = (
+    r"\b(?:type|write|tippe?|schreib(?:e)?|diktier(?:e)?)\b"
+    r"\s*(?:(?:ins?|das)\s+)?(?:aktiv\w*\s+)?(?:hier|here|direkt|aktiv\w*|fenster|window)\b"
+)
+_PAT_TYPE_TO_TELEGRAM = (
+    r"\b(?:send|type|write|sende|schick(?:e|en)?|übertrag(?:e|en)?|übermittle|schreib(?:e)?)\b"
+    r"\s*(?:an\s+|zu\s+|nach\s+|to\s+)?\btelegramm?\b"
+    r"|\b(?:go\s+to|open)\b\s*\btelegramm?\b"
+)
+
+# Signals for event-based chime timing
+_recording_ready_event = threading.Event()
+_recording_stopped_event = threading.Event()
 
 # ─── ALSA error suppression (once at startup) ──────────────
 # WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
@@ -542,6 +559,30 @@ def _soft_end_buzzer_sound(sample_rate=44100):
     return (signal * envelope * 0.30).astype(np.float32)
 
 
+def _mic_error_sound(sample_rate=44100):
+    """Short descending two-tone error signal: mic not ready / unavailable."""
+    segments = []
+    for freq in (880, 620):
+        n = int(sample_rate * 0.07)
+        t = np.arange(n, dtype=np.float32) / sample_rate
+        env = np.exp(-t * 28.0)
+        segments.append(np.sin(2 * np.pi * freq * t) * env * 0.38)
+    gap = np.zeros(int(sample_rate * 0.015), dtype=np.float32)
+    return np.concatenate([segments[0], gap, segments[1]])
+
+
+def _startup_ready_sound(sample_rate=44100):
+    """Short ascending three-note arpeggio: system ready / watch active."""
+    segments = []
+    for freq in (523, 659, 784):   # C5 → E5 → G5
+        n = int(sample_rate * 0.08)
+        t = np.arange(n, dtype=np.float32) / sample_rate
+        env = np.exp(-t * 18.0)
+        segments.append(np.sin(2 * np.pi * freq * t) * env * 0.32)
+        segments.append(np.zeros(int(sample_rate * 0.025), dtype=np.float32))
+    return np.concatenate(segments)
+
+
 def play_sound(sound_name, volume_boost: float = 1.0, blocking: bool = False):
     """Feedback-Sound abspielen.
     
@@ -563,6 +604,8 @@ def play_sound(sound_name, volume_boost: float = 1.0, blocking: bool = False):
     custom_sounds = {
         "record_start": _switch_click_sound,
         "record_end": _soft_end_buzzer_sound,
+        "mic_error": _mic_error_sound,
+        "startup_ready": _startup_ready_sound,
     }
 
     builder = custom_sounds.get(sound_name)
@@ -624,7 +667,7 @@ DUCK_FADE_DURATION = 1.0    # Seconds for fade to 0%
 DUCK_PRE_SOUND_PAUSE = 1.0  # Seconds of silence before start sound
 DUCK_POST_SOUND_PAUSE = 2.0 # Seconds pause after stop sound before music fades back
 SOUND_VOLUME_BOOST = 1.0    # Fixed playback gain for start/stop sounds
-SOUND_SINK_LEVEL = 75       # Fixed sink loudness (%) for start/stop sounds
+SOUND_SINK_LEVEL = 70       # Fixed sink loudness (%) for start/stop sounds
 
 
 def _parse_sink_inputs_by_pid() -> tuple[list, list]:
@@ -881,6 +924,30 @@ def _restore_sink_inputs(inputs: dict, duration: float = None):
         log.warning(f"  [restore] Sink-Input-Restore failed: {e}")
 
 
+def _play_chime(sound_name: str) -> None:
+    """Play a chime sound at SOUND_SINK_LEVEL (always fixed), then restore sinks.
+
+    Always temporarily raises all sinks to SOUND_SINK_LEVEL before playback
+    and restores them to their pre-call levels afterward.  Other apps' sink
+    inputs are muted for the duration so the chime is not buried under music.
+    Works regardless of whether DUCK_AUDIO_DURING_RECORDING is active.
+    """
+    sinks = _get_all_sinks()
+    other_inputs = _get_other_sink_inputs()
+    try:
+        if other_inputs:
+            _fade_sink_inputs_to(other_inputs, 0, duration=0.05)
+        if sinks:
+            _set_sink_volumes(sinks, {sid: SOUND_SINK_LEVEL for sid in sinks})
+        play_sound(sound_name)
+        time.sleep(0.5)
+    finally:
+        if sinks:
+            _set_sink_volumes(sinks, sinks)
+        if other_inputs:
+            _restore_sink_inputs(other_inputs, duration=0.05)
+
+
 def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
     """Misst den aktuellen Noise-Floor und leitet einen dynamischen Threshold ab.
 
@@ -1036,57 +1103,33 @@ def _mic_device_info() -> str:
         return f"<unbekannt: {e}>"
 
 
-def _check_mic_ready(max_wait_s: float = 3.0) -> bool:
-    """Checks if the stream delivers real audio data (kein all-zeros Buffer).
+def _check_mic_ready(max_wait_s: float = 3.0, n_stable_reads: int = 3) -> bool:
+    """Checks mic readiness: N consecutive successful stream.read() calls without exception.
 
-    After Bluetooth reconnect or PipeWire suspend the device delivers
-    kurze Zeit nur Nullen. Diese Funktion wartet bis real data ankommen
-    or max_wait_s is exceeded.
+    Ready = start_stream() already succeeded + N reads without error.
+    No RMS heuristics — pure stream I/O stability check.
 
-    Returns True wenn ready, False bei Timeout.
+    Returns True if ready, False on timeout.
     """
     deadline = time.time() + max_wait_s
-    check_chunks = int(0.1 * SAMPLE_RATE / CHUNK_SIZE)  # ~0.1s pro Check-Runde
+    consecutive_ok = 0
     attempts = 0
-    consecutive_ok = 0  # Anzahl aufeinanderfolgender checks mit RMS > 50
 
     while time.time() < deadline:
         attempts += 1
-        has_signal = False
-        max_rms = 0.0
-
-        for _ in range(check_chunks):
-            try:
-                data = _audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                rms = get_rms(data)
-                if rms > max_rms:
-                    max_rms = rms
-            except Exception as ex:
-                log.warning(f"  MIC-CHECK read-Error (attempt {attempts}): {ex}")
-                break
-
-        # Stufen:
-        #   ZEROS       RMS < 2   → Device komplett inactive
-        #   TRANSITIONING RMS 2-8 → Jabra wechselt Profil (A2DP→SCO), aber nutzbar
-        #   OK          RMS > 8   → stable signal, ready for recording
-        # Experience: RMS 5-7 during transition → recording works anyway (RMS 600+)
-        if max_rms > 8:
+        try:
+            _audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
             consecutive_ok += 1
-        else:
+            log.debug(f"  MIC-CHECK read {attempts}: OK ({consecutive_ok}/{n_stable_reads})")
+        except Exception as ex:
             consecutive_ok = 0
+            log.warning(f"  MIC-CHECK read {attempts}: FAILED ({ex})")
 
-        status = "OK" if max_rms > 8 else ("TRANSITIONING" if max_rms > 2 else "ZEROS")
-        log.debug(f"  MIC-CHECK attempt {attempts}: max_rms={max_rms:.1f} → {status} (consecutive_ok={consecutive_ok})")
-
-        if consecutive_ok >= 1:
-            log.info(f"  ✅ Microphone ready nach {attempts} Check(s), RMS={max_rms:.1f}")
+        if consecutive_ok >= n_stable_reads:
+            log.info(f"  ✅ Microphone ready after {attempts} read(s) ({n_stable_reads} consecutive OK)")
             return True
 
-        wait = min(0.2, deadline - time.time())
-        if wait > 0:
-            time.sleep(wait)
-
-    log.warning(f"  ⚠️  Microphone NICHT ready nach {max_wait_s:.1f}s ({attempts} checks) — starting anyway")
+    log.warning(f"  ⚠️  Microphone NOT ready after {max_wait_s:.1f}s ({attempts} attempts)")
     return False
 
 
@@ -1148,7 +1191,10 @@ def _schedule_idle_close(seconds: int = IDLE_CLOSE_SECONDS, reason: str = "idle-
         global _idle_close_timer
         with _idle_timer_lock:
             _idle_close_timer = None
-        if _recording_lock.locked():
+        # Defer close while recording or while watch loop is actively reading.
+        # Closing the stream while the watch loop blocks in read() causes a
+        # PortAudio segfault that kills the process.
+        if _recording_lock.locked() or (WATCH_ACTIVE and not WATCH_SUSPENDED):
             _schedule_idle_close(seconds=seconds, reason=reason)
             return
         _close_audio_stream(reason=reason)
@@ -1231,15 +1277,32 @@ def _match_trigger(text_lower, source="record"):
     for trig in ACTION_TRIGGERS:
         name = trig.get("name", "")
 
-        # Context-aware English-only matching for telegram action.
+        # Context-aware matching for active-window typing (verb + location marker).
+        if name == "type_to_active":
+            allow_context = not (CONTEXT_MATCH_WATCH_ONLY and source != "watch")
+            if allow_context:
+                _verb_pat = r"\b(?:type|write|tippe?|schreib(?:e)?|diktier(?:e)?)\b"
+                _loc_pat  = r"\b(?:hier|here|direkt|aktiv\w*|fenster|window)\b"
+                if REQUIRE_COMMAND_PREFIX and source != "watch":
+                    has_verb = bool(re.search(r"^\s*" + _verb_pat, text_lower))
+                else:
+                    has_verb = bool(re.search(_verb_pat, text_lower))
+                has_loc = bool(re.search(_loc_pat, text_lower))
+                if has_verb and has_loc:
+                    return trig, "__active_intent__"
+
+        # Context-aware matching for telegram action (English + German verbs).
         if name == "type_to_telegram":
             allow_context = not (CONTEXT_MATCH_WATCH_ONLY and source != "watch")
             if allow_context:
                 has_target = bool(re.search(r"\btelegramm?\b", text_lower))
-                if REQUIRE_COMMAND_PREFIX:
-                    has_verb = bool(re.search(r"^\s*(?:send|type|write|go\s+to|open)\b", text_lower))
+                # German: sende/schicke/schreibe/übertrage/übermittle + English: send/type/write/open
+                _verb_pat = r"\b(?:send|type|write|go\s+to|open|sende|schick(?:e|en)?|übertrag(?:e|en)?|übermittle|schreib(?:e)?)\b"
+                # In watch mode verb may appear anywhere; in record mode respect REQUIRE_COMMAND_PREFIX.
+                if REQUIRE_COMMAND_PREFIX and source != "watch":
+                    has_verb = bool(re.search(r"^\s*" + _verb_pat, text_lower))
                 else:
-                    has_verb = bool(re.search(r"\b(send|type|write|go\s+to|open)\b", text_lower))
+                    has_verb = bool(re.search(_verb_pat, text_lower))
                 if has_target and has_verb:
                     return trig, "__telegram_intent__"
 
@@ -1280,54 +1343,6 @@ def _run_action_trigger(trig, text, raw_text=None):
         return False, str(ex)
 
 
-def _handle_actions_for_transcript(text, source="record"):
-    """Matches and executes first action trigger. Returns True if action consumed output."""
-    if not ACTION_TRIGGERS:
-        return False
-    raw = text or ""
-    text_lower = raw.lower()
-    trig, phrase = _match_trigger(text_lower, source=source)
-    if not trig:
-        log.debug(f"  [action:{source}] no trigger match for: {raw[:120]}")
-        return False
-
-    name = trig.get("name", "<unnamed>")
-
-    # Global + per-trigger cooldown
-    now = time.time()
-    last = _trigger_last_fire.get(name, 0.0)
-    trig_cd_ms = int(trig.get("cooldown_ms", ACTION_COOLDOWN_MS)) if str(trig.get("cooldown_ms", "")).strip() else ACTION_COOLDOWN_MS
-    if (now - last) * 1000.0 < trig_cd_ms:
-        log.debug(f"  [action:{source}] cooldown skip for '{name}' ({trig_cd_ms}ms)")
-        return False
-
-    # Build payload by removing matched trigger phrase from transcript.
-    payload = raw
-    if name == "type_to_telegram":
-        cmd_pattern = r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b|\b(?:go\s+to|open)\b\s*\btelegramm?\b"
-        payload = re.sub(cmd_pattern, "", raw, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
-        # Do not fire if only command words were recognized.
-        if not payload:
-            log.debug(f"  [action:{source}] telegram intent found but payload empty")
-            return False
-    else:
-        if phrase and phrase != "__telegram_intent__":
-            idx = text_lower.find(phrase)
-            if idx >= 0:
-                payload = (raw[:idx] + raw[idx + len(phrase):]).strip(" ,.!?;:-")
-        if not payload:
-            payload = raw
-
-    log.info(f"  [action:{source}] match → {name} | phrase='{phrase}' | payload='{payload[:120]}'")
-    ok, msg = _run_action_trigger(trig, payload, raw_text=raw)
-    if ok:
-        _trigger_last_fire[name] = now
-        log.info(f"  [action:{source}] ✅ Trigger '{name}' executed")
-        return True
-    log.warning(f"  [action:{source}] ❌ Trigger '{name}' failed: {msg}")
-    return False
-
-
 def _build_status_payload():
     now = time.time()
     watch_remaining = None
@@ -1359,6 +1374,8 @@ def _handle_control_request(req):
     if op == "watch.stop":
         WATCH_ACTIVE = False
         WATCH_UNTIL_TS = None
+        # Schedule stream close shortly — safe now that watch loop will idle.
+        _schedule_idle_close(3, "watch-stop")
         return {"ok": True, "message": "watch stopped"}
 
     if op == "watch.duration":
@@ -1453,7 +1470,7 @@ def _watch_loop():
     """
     global WATCH_ACTIVE, WATCH_UNTIL_TS, _audio_stream
 
-    silence_s = max(0.3, VAD_MIN_SILENCE_MS / 1000.0)
+    silence_s = max(0.3, WATCH_SILENCE_MS / 1000.0)
     max_segment_s = max(2.0, WATCH_MAX_SEGMENT_MS / 1000.0)
     intent_idle_s = max(0.6, WATCH_INTENT_IDLE_MS / 1000.0)
 
@@ -1499,20 +1516,25 @@ def _watch_loop():
 
         # Build payload without keyword phrase (keep text before+after keyword).
         payload = full_text
-        if name == "type_to_telegram":
-            cmd_pattern = r"\b(?:send|type|write)\b\s*(?:to\s+)?\btelegramm?\b|\b(?:go\s+to|open)\b\s*\btelegramm?\b"
-            payload = re.sub(cmd_pattern, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
+        if name == "type_to_active":
+            payload = re.sub(_PAT_TYPE_TO_ACTIVE, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
+        elif name == "type_to_telegram":
+            payload = re.sub(_PAT_TYPE_TO_TELEGRAM, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
         else:
             phrase = intent.get("phrase")
-            if phrase and phrase != "__telegram_intent__":
+            if phrase and phrase != "__telegram_intent__" and phrase != "__active_intent__":
                 idx = full_text.lower().find(phrase)
                 if idx >= 0:
                     payload = (full_text[:idx] + full_text[idx + len(phrase):]).strip(" ,.!?;:-")
 
         if not payload:
-            log.info(f"  [watch] finalize intent '{name}' skipped (empty payload)")
-            intent = None
-            return
+            # Typing triggers need actual text — discard if nothing to type.
+            # Command-only triggers (disable_watch, extend_watch_5m, …) run without payload.
+            if name in ("type_to_telegram", "type_to_active"):
+                log.info(f"  [watch] finalize intent '{name}' skipped (empty payload)")
+                intent = None
+                return
+            payload = full_text  # use full spoken text as env var for command triggers
 
         ok, msg = _run_action_trigger(trig, payload, raw_text=full_text)
         if ok:
@@ -1537,7 +1559,16 @@ def _watch_loop():
             _cancel_idle_close_timer()
             _open_audio_stream()
             if _audio_stream.is_stopped():
-                _audio_stream.start_stream()
+                # close() + fresh open() so PipeWire re-activates BT HFP mic.
+                # start_stream() on an already-opened stopped stream does NOT
+                # trigger PipeWire to re-activate the Bluetooth HFP profile,
+                # so the stream would return zeros and no speech is detected.
+                try:
+                    _audio_stream.close()
+                except Exception:
+                    pass
+                _audio_stream = None
+                _open_audio_stream()
 
             data = _audio_stream.read(VAD_CHUNK_SAMPLES, exception_on_overflow=False)
             chunk_i16 = np.frombuffer(data, dtype=np.int16)
@@ -1562,6 +1593,7 @@ def _watch_loop():
             seg_elapsed = (now - segment_start_ts) if in_segment else 0.0
             silence_elapsed = (now - last_speech_ts) if in_segment else 0.0
             if in_segment and (silence_elapsed >= silence_s or seg_elapsed >= max_segment_s):
+                cut_by_max = seg_elapsed >= max_segment_s and silence_elapsed < silence_s
                 in_segment = False
                 if segment_frames:
                     audio_data = b"".join(segment_frames)
@@ -1586,14 +1618,29 @@ def _watch_loop():
                                     "phrase": phrase,
                                     "name": trig.get("name", "<unnamed>"),
                                     "collected": text,
-                                    "last_update": now,
+                                    "last_update": time.time(),
                                 }
                                 log.info(f"  [watch-final] intent='{intent['name']}' detected")
                         else:
-                            _append_to_intent(text, now)
+                            _append_to_intent(text, time.time())
                             log.info(f"  [watch-final] intent collect += '{text[:120]}'")
 
-            _finalize_intent_if_due(now)
+                    # If segment was cut by max-duration (not by silence), user is likely
+                    # still speaking — restart segment capture so intent idle timer doesn't
+                    # fire during the transcription gap.
+                    if cut_by_max:
+                        t_now = time.time()
+                        in_segment = True
+                        segment_start_ts = t_now
+                        last_speech_ts = t_now
+                        segment_frames = []
+                        log.debug("  [watch] max-cut: restarting segment (speech ongoing)")
+
+            # Only finalize when no segment is active — a mid-sentence natural pause
+            # of >intent_idle_ms would otherwise fire the intent against the previous
+            # segment's timestamp while the user is still speaking.
+            if not in_segment:
+                _finalize_intent_if_due(now)
 
         except Exception as ex:
             msg = str(ex)
@@ -1622,11 +1669,11 @@ def _start_watch_thread():
 
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """Hauptfunktion: Aufnehmen → Transcribingn → Typing
-    
+
     ptt_mode: If True, Push-to-Talk mode (stop on key release, send with Enter)
     skip_start_sound: If True, start sound was already played (PTT mode)
     """
-    global _ptt_stop_requested, WATCH_SUSPENDED
+    global _ptt_stop_requested, WATCH_SUSPENDED, WATCH_ACTIVE
 
     # Lock statt bool: verhindert Race-Condition bei schnell-mehrfachem Hotkey
     if not _recording_lock.acquire(blocking=False):
@@ -1635,8 +1682,10 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
     # Reset PTT stop flag
     _ptt_stop_requested = False
+    _recording_ready_event.clear()
+    _recording_stopped_event.clear()
     WATCH_SUSPENDED = True
-    
+
     mode_str = "PTT" if ptt_mode else "Toggle"
     log.info("━" * 60)
     log.info(f"▶  Recording sequence starting ({mode_str} mode)")
@@ -1645,6 +1694,12 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     finally:
         _ptt_stop_requested = False
         WATCH_SUSPENDED = False
+        # Key press always re-enables watch mode if it was disabled.
+        # (Triggers only fire in watch mode, not during key recordings.)
+        if not WATCH_ACTIVE:
+            WATCH_ACTIVE = True
+            WATCH_UNTIL_TS = None
+            log.info("  🎙️  Watch mode re-enabled by key press")
         _recording_lock.release()
         _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="post-record-idle")
         log.info("◀  Recording sequence finished")
@@ -1698,8 +1753,19 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
             log.info(f"  [2] Zweiter check: mic_ready={mic_ready}")
         except Exception as e:
             log.error(f"  [2] ❌ Stream-Neustart failed: {e}")
-            notify("❌ Audio-Error", f"Mic not ready: {e}", "critical")
+            notify("❌ Mic not ready", f"Mic error: {e}", "critical")
+            _play_chime("mic_error")
             return
+
+    if not mic_ready:
+        log.error("  [2] ❌ Mic not ready after retry — aborting")
+        notify("❌ Mic not ready", "Microphone not available", "critical")
+        _play_chime("mic_error")
+        return
+
+    # Signal that recording pipeline is armed and mic is ready.
+    # This is only reached when start_stream() + N consecutive reads all succeeded.
+    _recording_ready_event.set()
 
     # ── 2b. Sink-Volumes erfassen (kein per-app Ducking) ─────────
     _original_sinks = {}
@@ -1719,20 +1785,8 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
         # ── 2d. Start-Sound
         log.info(f"  [2d] 🔔 Start-Sound @ {SOUND_SINK_LEVEL}%")
-        _chime_other_inputs = {}
-        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-            # Keep background apps muted while temporarily raising sink for chime.
-            _chime_other_inputs = _get_other_sink_inputs()
-            if _chime_other_inputs:
-                _fade_sink_inputs_to(_chime_other_inputs, 0, duration=0.05)
-            _set_sink_volumes(_original_sinks, {sid: SOUND_SINK_LEVEL for sid in _original_sinks})
-        play_sound("record_start")
+        _play_chime("record_start")
         notify("🔴 Recording", "Speak now...")
-        time.sleep(0.5)   # Sound fertig abspielen lassen
-        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-            _set_sink_volumes(_original_sinks, {sid: DUCK_SINK_LEVEL for sid in _original_sinks})
-            if _chime_other_inputs:
-                _restore_sink_inputs(_chime_other_inputs, duration=0.05)
     else:
         log.info("  [2d] ⏭️  Start-Sound skipped (PTT mode)")
         notify("🔴 PTT Recording", "Speak...")
@@ -1770,23 +1824,14 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
             log.info(f"  [4] ⏹  Stream stopped nach {elapsed_record:.2f}s | active={_audio_stream.is_active()}")
         except Exception as ex:
             log.warning(f"  [4] stop_stream() Error: {ex}")
+        finally:
+            _recording_stopped_event.set()
 
     # ── 5. Stop-Sound (Music ist noch geduckt) ─────────────────────
     # In PTT mode, stop sound was already played on key release
     if not ptt_mode:
         log.info(f"  [5] 🔔 Stop-Sound @ {SOUND_SINK_LEVEL}%")
-        _chime_other_inputs = {}
-        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-            _chime_other_inputs = _get_other_sink_inputs()
-            if _chime_other_inputs:
-                _fade_sink_inputs_to(_chime_other_inputs, 0, duration=0.05)
-            _set_sink_volumes(_original_sinks, {sid: SOUND_SINK_LEVEL for sid in _original_sinks})
-        play_sound("record_end")
-        time.sleep(0.5)
-        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-            _set_sink_volumes(_original_sinks, {sid: DUCK_SINK_LEVEL for sid in _original_sinks})
-            if _chime_other_inputs:
-                _restore_sink_inputs(_chime_other_inputs, duration=0.05)
+        _play_chime("record_end")
     else:
         log.info("  [5] ⏭️  Stop-Sound skipped (PTT mode, already played)")
 
@@ -1838,12 +1883,9 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
     log.info(f"  [7] 📝 [{lang}] ({elapsed_trans:.1f}s) {text}")
 
-    # ── 7b. Action triggers (recording + watch) ────────────────
-    action_consumed = _handle_actions_for_transcript(text, source="record")
-    if action_consumed:
-        notify("✅ Action", text[:80])
-        log.info("  [7b] Action consumed transcript (skip default typing)")
-        return
+    # ── 7b. Action triggers (watch-only) ───────────────────────
+    # Triggers only fire in watch mode, not during key-press recordings.
+    # During PTT/key recording the full text is typed normally.
 
     # ── 8. Type text into active window ─────────────────────────
     time.sleep(0.3)
@@ -1960,8 +2002,12 @@ def listen_keyboard_hotkey(hotkey):
 
                         # Optional UX chime after recording has started (non-blocking).
                         def _late_ptt_chime():
-                            time.sleep(0.08)
-                            play_sound("record_start", volume_boost=SOUND_VOLUME_BOOST)
+                            # Event-driven: chime only after recording path reports mic-ready.
+                            # Timeout keeps UX responsive if readiness event is delayed.
+                            ready = _recording_ready_event.wait(timeout=1.5)
+                            if not ready:
+                                log.warning("  [ptt] ready-event timeout; playing start chime fallback")
+                            _play_chime("record_start")
                         threading.Thread(target=_late_ptt_chime, daemon=True).start()
                 
                 threading.Thread(target=check_ptt, daemon=True).start()
@@ -1981,12 +2027,18 @@ def listen_keyboard_hotkey(hotkey):
             ptt_state['ptt_active'] = False
             
             if was_ptt:
-                # PTT mode: stop recording (handled in do_voice_input via flag)
+                # PTT mode: request stop, then play stop sound when stream actually stopped.
                 log.info(f"◀  PTT release after {press_duration:.1f}s — Stopping")
-                # Play stop sound IMMEDIATELY
-                play_sound("record_end", volume_boost=SOUND_VOLUME_BOOST)
                 global _ptt_stop_requested
                 _ptt_stop_requested = True
+
+                def _ptt_stop_chime_on_event():
+                    stopped = _recording_stopped_event.wait(timeout=2.5)
+                    if not stopped:
+                        log.warning("  [ptt] stop-event timeout; playing stop chime fallback")
+                    _play_chime("record_end")
+
+                threading.Thread(target=_ptt_stop_chime_on_event, daemon=True).start()
             elif press_duration < ptt_state['ptt_threshold'] and not _recording_lock.locked():
                 # Short press: toggle mode (original behavior)
                 log.info("▶  Short press — Toggle mode")
@@ -2032,7 +2084,7 @@ def main():
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
     global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS, WATCH_RMS_THRESHOLD
-    global WATCH_MAX_SEGMENT_MS, WATCH_INTENT_IDLE_MS
+    global WATCH_MAX_SEGMENT_MS, WATCH_INTENT_IDLE_MS, WATCH_SILENCE_MS
 
     # ── Config File laden (Defaults) ─────────────────────────────
     cfg = load_config()
@@ -2090,6 +2142,12 @@ def main():
             WATCH_MAX_SEGMENT_MS = int(watch_cfg["max_segment_ms"])
         except Exception:
             pass
+    if watch_cfg.get("silence_ms") is not None:
+        try:
+            WATCH_SILENCE_MS = int(watch_cfg["silence_ms"])
+        except (ValueError, TypeError):
+            pass
+
     if watch_cfg.get("intent_idle_ms") is not None:
         try:
             WATCH_INTENT_IDLE_MS = int(watch_cfg["intent_idle_ms"])
@@ -2173,7 +2231,7 @@ Config File: ~/.config/voice-type/config.toml
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
     log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
-    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD} max_seg={WATCH_MAX_SEGMENT_MS}ms intent_idle={WATCH_INTENT_IDLE_MS}ms")
+    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD} max_seg={WATCH_MAX_SEGMENT_MS}ms silence={WATCH_SILENCE_MS}ms intent_idle={WATCH_INTENT_IDLE_MS}ms")
 
     # Signal Handler
     def signal_handler(sig, frame):
@@ -2185,9 +2243,11 @@ Config File: ~/.config/voice-type/config.toml
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Control socket (okawhispctl)
+    # Control socket (okawhispctl) — starts early, no audio interaction.
+    # Watch thread is started after full init (model load + warmup + stream open)
+    # to avoid a race where it opens the stream before the warm-start stop_stream()
+    # and then tries start_stream() on a BT HFP stream that PipeWire won't re-activate.
     _start_control_server()
-    _start_watch_thread()
 
     # GPU checkingn
     device = "cpu"
@@ -2262,6 +2322,28 @@ Config File: ~/.config/voice-type/config.toml
             print(f"  ⚠️  silero-vad not available → RMS-Fallback active")
     print()
 
+    # Whisper warmup — first CUDA inference compiles kernels (3–8s).
+    # Run a tiny silent dummy through transcribe_faster_whisper now so the
+    # first real speech segment is not dropped.
+    if engine_type in ("faster", "api") or _server_available:
+        print(f"  🔥 Warming up Whisper (first CUDA run)...", end=" ", flush=True)
+        try:
+            _warmup_audio = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+            transcribe_faster_whisper(_warmup_audio)
+            print("done")
+        except Exception as _we:
+            print(f"skipped ({_we})")
+    elif engine_type == "openai" and model is not None:
+        print(f"  🔥 Warming up Whisper (first CUDA run)...", end=" ", flush=True)
+        try:
+            import torch
+            _warmup_audio = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+            model.transcribe(_warmup_audio)
+            print("done")
+        except Exception as _we:
+            print(f"skipped ({_we})")
+    print()
+
     # xdotool checkingn
     try:
         subprocess.run(['xdotool', '--version'], capture_output=True, check=True)
@@ -2316,6 +2398,16 @@ Config File: ~/.config/voice-type/config.toml
     print(f"  │  Ctrl+C zum Beenden                             │")
     print("  └─────────────────────────────────────────────────┘")
     print()
+
+    # Signal readiness — plays after model load + warmup, right before hotkey loop.
+    _play_chime("startup_ready")
+    log.info("  ✅ Startup complete — watch mode ready")
+
+    # Start watch thread here, after full init (model loaded, stream opened).
+    # This ensures _open_audio_stream() in the watch loop creates a fresh stream
+    # rather than trying to restart a warm-start-stopped BT HFP stream (which
+    # PipeWire would not re-activate on start_stream()).
+    _start_watch_thread()
 
     if not listen_keyboard_hotkey(args.key):
         listen_xbindkeys_hotkey(args.key)
