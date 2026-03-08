@@ -212,6 +212,11 @@ WATCH_UNTIL_TS = None
 
 ACTION_TRIGGERS = []
 
+WATCH_CHUNK_WINDOW_MS = 1200
+WATCH_CHUNK_HOP_MS = 300
+WATCH_PARTIAL_FLUSH_MS = 1500
+_watch_thread = None
+
 # ─── ALSA error suppression (once at startup) ──────────────
 # WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
 # Mehrfaches Setzen verursacht SEGV-Crashes
@@ -1346,6 +1351,98 @@ def _start_control_server():
     _control_server_thread.start()
 
 
+def _watch_loop():
+    """Background watch listener: builds rolling chunks and runs action triggers without hotkey."""
+    global WATCH_ACTIVE, WATCH_UNTIL_TS
+
+    ring = []
+    window_samples = int((WATCH_CHUNK_WINDOW_MS / 1000.0) * SAMPLE_RATE)
+    max_ring = max(window_samples * 2, VAD_CHUNK_SAMPLES * 4)
+
+    next_flush_ts = time.time() + (WATCH_PARTIAL_FLUSH_MS / 1000.0)
+    next_hop_ts = time.time()
+    last_speech_ts = 0.0
+
+    while not should_exit:
+        # Respect explicit watch stop / duration expiry
+        if WATCH_UNTIL_TS and time.time() >= WATCH_UNTIL_TS:
+            WATCH_ACTIVE = False
+            WATCH_UNTIL_TS = None
+
+        # Only run watch when enabled and not actively recording via hotkey
+        if not WATCH_ACTIVE or _recording_lock.locked():
+            try:
+                if _audio_stream is not None and _audio_stream.is_active():
+                    _audio_stream.stop_stream()
+            except Exception:
+                pass
+            time.sleep(0.05)
+            continue
+
+        try:
+            _cancel_idle_close_timer()
+            _open_audio_stream()
+            if _audio_stream.is_stopped():
+                _audio_stream.start_stream()
+
+            data = _audio_stream.read(VAD_CHUNK_SAMPLES, exception_on_overflow=False)
+            chunk_i16 = np.frombuffer(data, dtype=np.int16)
+            ring.extend(chunk_i16.tolist())
+            if len(ring) > max_ring:
+                ring = ring[-max_ring:]
+
+            # Activity tracking (lightweight gate in watch mode)
+            if get_rms(chunk_i16.tobytes()) > SILENCE_THRESHOLD:
+                last_speech_ts = time.time()
+
+            now = time.time()
+            if now < next_hop_ts:
+                time.sleep(min(0.01, next_hop_ts - now))
+                continue
+            next_hop_ts = now + (WATCH_CHUNK_HOP_MS / 1000.0)
+
+            if now < next_flush_ts:
+                continue
+            next_flush_ts = now + (WATCH_PARTIAL_FLUSH_MS / 1000.0)
+
+            # Only flush if we heard recent speech
+            if last_speech_ts <= 0 or (now - last_speech_ts) > (VAD_MIN_SILENCE_MS / 1000.0):
+                continue
+
+            if len(ring) < max(256, window_samples // 2):
+                continue
+
+            window = np.array(ring[-window_samples:], dtype=np.int16) if len(ring) >= window_samples else np.array(ring, dtype=np.int16)
+            audio_np = window.astype(np.float32) / 32768.0
+
+            try:
+                if engine_type == "api":
+                    text, _lang = transcribe_via_api(audio_np)
+                elif engine_type == "faster":
+                    text, _lang = transcribe_faster_whisper(audio_np)
+                else:
+                    text, _lang = transcribe_openai_whisper(audio_np)
+            except Exception as ex:
+                log.warning(f"  [watch] transcribe failed: {ex}")
+                continue
+
+            text = (text or "").strip()
+            if not text:
+                continue
+
+            _handle_actions_for_transcript(text)
+
+        except Exception as ex:
+            log.warning(f"  [watch] loop error: {ex}")
+            time.sleep(0.2)
+
+
+def _start_watch_thread():
+    global _watch_thread
+    _watch_thread = threading.Thread(target=_watch_loop, daemon=True)
+    _watch_thread.start()
+
+
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """Hauptfunktion: Aufnehmen → Transcribingn → Typing
     
@@ -1747,6 +1844,7 @@ def main():
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, WATCH_ACTIVE
+    global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS
 
     # ── Config File laden (Defaults) ─────────────────────────────
     cfg = load_config()
@@ -1756,6 +1854,7 @@ def main():
     sounds = cfg.get("sounds", {})
     api_cfg = cfg.get("api", {})
     watch_cfg = cfg.get("watch", {})
+    trans_cfg = cfg.get("transcription", {})
     actions_cfg = cfg.get("actions", {})
 
     # Config values as defaults (CLI overrides these)
@@ -1776,6 +1875,22 @@ def main():
         except Exception:
             pass
     WATCH_ACTIVE = IDLE_CLOSE_SECONDS > 0
+
+    if trans_cfg.get("chunk_window_ms") is not None:
+        try:
+            WATCH_CHUNK_WINDOW_MS = int(trans_cfg["chunk_window_ms"])
+        except Exception:
+            pass
+    if trans_cfg.get("chunk_hop_ms") is not None:
+        try:
+            WATCH_CHUNK_HOP_MS = int(trans_cfg["chunk_hop_ms"])
+        except Exception:
+            pass
+    if trans_cfg.get("partial_flush_ms") is not None:
+        try:
+            WATCH_PARTIAL_FLUSH_MS = int(trans_cfg["partial_flush_ms"])
+        except Exception:
+            pass
 
     ACTION_TRIGGERS = actions_cfg.get("triggers", []) if isinstance(actions_cfg.get("triggers", []), list) else []
 
@@ -1844,6 +1959,7 @@ Config File: ~/.config/voice-type/config.toml
     log.info(f"   Log-Datei: {LOG_FILE}")
     log.info("=" * 60)
     log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
+    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms")
 
     # Signal Handler
     def signal_handler(sig, frame):
@@ -1857,6 +1973,7 @@ Config File: ~/.config/voice-type/config.toml
 
     # Control socket (okawhispctl)
     _start_control_server()
+    _start_watch_thread()
 
     # GPU checkingn
     device = "cpu"
