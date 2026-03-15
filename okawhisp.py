@@ -30,8 +30,6 @@ Usage:
   python okawhisp.py --prompt "NestJS, Flutter"  # Context hints
 """
 
-import pyaudio
-import numpy as np
 import subprocess
 import threading
 import time
@@ -40,12 +38,24 @@ import signal
 import argparse
 import warnings
 import os
+
+try:
+    import pyaudio
+except ImportError:
+    print("❌ PyAudio not installed. Run: sudo apt install portaudio19-dev && pip install --user pyaudio")
+    sys.exit(1)
+try:
+    import numpy as np
+except ImportError:
+    print("❌ NumPy not installed. Run: pip install --user numpy")
+    sys.exit(1)
 import io
 import wave
 import logging
 import json
 import socket
 import re
+import queue as _queue_mod
 from pathlib import Path
 from datetime import datetime
 try:
@@ -79,7 +89,7 @@ _fh.setFormatter(_log_formatter)
 _fh.setLevel(logging.DEBUG)
 log.addHandler(_fh)
 
-# Console-Handler (nur INFO+)
+# Console handler (INFO+ only)
 _ch = logging.StreamHandler(sys.stdout)
 _ch.setFormatter(_log_formatter)
 _ch.setLevel(logging.INFO)
@@ -173,20 +183,20 @@ def load_config() -> dict:
                 log.warning(f"  ⚠️  Config error ({path}): {e}")
     return {}
 
-# ─── Globale Variablen ───────────────────────────────────────────
+# ─── Global Variables ────────────────────────────────────────────
 
 model = None
 should_exit = False
 engine_type = "faster"
-_vad_model = None           # silero-vad Modell (loaded beim Start)
+_vad_model = None           # silero-vad model (loaded at startup)
 
-# Statt eines einfachen bool: Lock verhindert Race-Condition bei schnellen Hotkey-Presses
-# mehrfach pressed wird (bool-Check + bool-Set ist kein atomarer Vorgang).
+# Lock instead of bool: prevents race condition on rapid hotkey presses
+# (bool check + set is not atomic).
 _recording_lock = threading.Lock()
 _ptt_stop_requested = False  # PTT mode: stop when key released
 
-# Persistente PyAudio-Instanz; Stream wird bei Bedarf geöffnet/geschlossen.
-# Startet "warm" und wird nach Idle-Timeout wieder geschlossen (Privacy + GNOME mic indicator).
+# Persistent PyAudio instance; stream is opened/closed on demand.
+# Starts "warm" and closes after idle timeout (privacy + GNOME mic indicator).
 _pyaudio_instance = None
 _audio_stream = None
 
@@ -210,14 +220,13 @@ REQUIRE_COMMAND_PREFIX = True
 
 _trigger_last_fire = {}
 
-WATCH_CHUNK_WINDOW_MS = 1200
-WATCH_CHUNK_HOP_MS = 300
-WATCH_PARTIAL_FLUSH_MS = 1500
-WATCH_RMS_THRESHOLD = 30
 WATCH_MAX_SEGMENT_MS = 10000
-WATCH_INTENT_IDLE_MS = 1400
-WATCH_SILENCE_MS     = 1200  # Silence after last speech to end a watch segment
+WATCH_SILENCE_MS     = 1200  # VAD silence after last speech to end a watch segment
+WATCH_MIN_SEGMENT_MS = 600   # Minimum segment length to bother transcribing
 WATCH_SUSPENDED = False
+
+# Queue for non-blocking watch-mode transcription
+_watch_transcribe_queue = _queue_mod.Queue(maxsize=4)
 
 # ─── Trigger payload-extraction patterns (shared across watch + record paths) ──
 # Removing the command phrase before typing the remaining text.
@@ -236,8 +245,8 @@ _recording_ready_event = threading.Event()
 _recording_stopped_event = threading.Event()
 
 # ─── ALSA error suppression (once at startup) ──────────────
-# WICHTIG: Nur EINMAL setzen, nicht bei jedem Recording!
-# Mehrfaches Setzen verursacht SEGV-Crashes
+# IMPORTANT: Set only ONCE, not on every recording!
+# Setting multiple times causes SEGV crashes
 try:
     ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
     def py_error_handler(filename, line, function, err, fmt):
@@ -245,12 +254,12 @@ try:
     c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
     asound = cdll.LoadLibrary('libasound.so.2')
     asound.snd_lib_error_set_handler(c_error_handler)
-except:
-    pass  # If ALSA not available
+except (OSError, AttributeError):
+    pass  # ALSA not available (Wayland-only, non-Linux, etc.)
 
 
 def load_model_faster_whisper(model_size, device):
-    """faster-whisper Modell laden (4x schneller)"""
+    """Load faster-whisper model (4x faster than OpenAI)"""
     from faster_whisper import WhisperModel
 
     compute_type = "float16" if device == "cuda" else "int8"
@@ -264,7 +273,7 @@ def load_model_faster_whisper(model_size, device):
 
 
 def load_model_openai_whisper(model_size, device):
-    """Original OpenAI Whisper Modell laden"""
+    """Load original OpenAI Whisper model"""
     import whisper
     return whisper.load_model(model_size, device=device)
 
@@ -317,15 +326,15 @@ def transcribe_via_server(audio_np):
 
 
 def transcribe_faster_whisper(audio_np):
-    """Transkription mit faster-whisper — bevorzugt whisper-server (GPU shared),
+    """Transcription with faster-whisper — prefers whisper-server (GPU shared),
     falls back to local instance if server not reachable."""
 
-    # Server-attempt zuerst (Modell readys loaded, GPU)
+    # Try server first (model already loaded, GPU)
     result = transcribe_via_server(audio_np)
     if result is not None:
         return result
 
-    # Lokaler Fallback (model muss loaded sein)
+    # Local fallback (model must be loaded)
     if model is None:
         return "", "?"
 
@@ -349,7 +358,7 @@ def transcribe_faster_whisper(audio_np):
 
 
 def transcribe_openai_whisper(audio_np):
-    """Transkription mit Original OpenAI Whisper"""
+    """Transcription with original OpenAI Whisper"""
     result = model.transcribe(
         audio_np,
         language=LANGUAGE,
@@ -363,12 +372,12 @@ def transcribe_openai_whisper(audio_np):
 
 
 def transcribe_via_api(audio_np):
-    """Transcription via OpenAI-kompatibler API.
+    """Transcription via OpenAI-compatible API.
 
     Works with:
       - OpenAI (api.openai.com)        → WHISPER_API_MODEL = "whisper-1"
       - Groq   (api.groq.com/openai/v1) → WHISPER_API_MODEL = "whisper-large-v3"
-      - lokaler whisper.cpp Server      → WHISPER_API_BASE_URL = "http://localhost:8080"
+      - local whisper.cpp server        → WHISPER_API_BASE_URL = "http://localhost:8080"
       - any other OpenAI-compatible endpoint
 
     Configuration via config file [api] or --api-url / --api-key CLI args.
@@ -379,7 +388,7 @@ def transcribe_via_api(audio_np):
         import urllib.error
         import json
 
-        # Audio als WAV in Memory-Buffer schreiben
+        # Write audio as WAV to in-memory buffer
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, 'wb') as wf:
             wf.setnchannels(1)
@@ -421,7 +430,7 @@ def transcribe_via_api(audio_np):
             return text, lang
 
     except Exception as e:
-        log.error(f"  [api] ❌ API-Transkription failed: {e}")
+        log.error(f"  [api] ❌ API transcription failed: {e}")
         raise
 
 
@@ -452,7 +461,7 @@ def _play_pcm_sound(samples, sample_rate=44100):
 
 
 def _play_audio_file(file_path, blocking: bool = False):
-    """Spielt eine Audio-Datei ab via paplay (PulseAudio/PipeWire).
+    """Play an audio file via paplay (PulseAudio/PipeWire).
 
     paplay routes through PipeWire → correct output device regardless of
     which sink is active (headset, speakers, HDMI).
@@ -503,7 +512,7 @@ def _switch_click_sound(sample_rate=44100):
         pulse = amp * np.sin(2 * np.pi * freq * t) * np.exp(-decay * t)
         signal[start:end] += pulse.astype(np.float32)
 
-    # Zweifach-Puls erzeugt den "Switch"-Charakter statt eines simplen Beeps.
+    # Double pulse creates the "switch" character instead of a simple beep.
     add_pulse(start_ms=0.0, freq=2200, amp=0.55, decay=170)
     add_pulse(start_ms=9.0, freq=1350, amp=0.40, decay=180)
 
@@ -518,12 +527,12 @@ def _switch_click_sound(sample_rate=44100):
 
 
 def _soft_end_buzzer_sound(sample_rate=44100):
-    """Leichter elektronischer End-Ton (dezenter Buzzer)."""
+    """Soft electronic end tone (subtle buzzer)."""
     duration = 0.24
     n = int(sample_rate * duration)
     t = np.arange(n, dtype=np.float32) / sample_rate
 
-    # Sanfter Down-Sweep: signalisiert "Ende" ohne hart zu klingen.
+    # Soft down-sweep: signals "end" without sounding harsh.
     freq = np.linspace(780.0, 620.0, n, dtype=np.float32)
     phase = 2.0 * np.pi * np.cumsum(freq) / sample_rate
 
@@ -566,7 +575,7 @@ def _startup_ready_sound(sample_rate=44100):
 
 
 def play_sound(sound_name, blocking: bool = False):
-    """Feedback-Sound abspielen via paplay (PipeWire-routed).
+    """Play feedback sound via paplay (PipeWire-routed).
 
     Priority: custom file → synthetic sound → system sound.
     """
@@ -605,7 +614,7 @@ def play_sound(sound_name, blocking: bool = False):
 
 
 def notify(title, message, urgency="normal"):
-    """Desktop-Notification senden (optional)"""
+    """Send desktop notification (optional)"""
     try:
         subprocess.Popen(
             ['notify-send', '-u', urgency, '-t', '2000', title, message],
@@ -616,7 +625,7 @@ def notify(title, message, urgency="normal"):
 
 
 def type_text(text):
-    """Text ins activee Fenster tippen via xdotool"""
+    """Type text into the active window via xdotool"""
     try:
         subprocess.run(
             ['xdotool', 'type', '--delay', '10', '--clearmodifiers', text],
@@ -630,7 +639,7 @@ def type_text(text):
 
 
 def get_rms(data):
-    """Root Mean Square eines Audio-Chunks berechnen"""
+    """Calculate Root Mean Square of an audio chunk"""
     audio_data = np.frombuffer(data, dtype=np.int16)
     if len(audio_data) == 0:
         return 0
@@ -639,14 +648,14 @@ def get_rms(data):
 
 
 def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
-    """Misst den aktuellen Noise-Floor und leitet einen dynamischen Threshold ab.
+    """Measure current noise floor and derive a dynamic threshold.
 
-    Liest `duration_s` Sekunden Audio (~12 Chunks bei 0.8s) und verwendet das
-    20. percentile of RMS values — more robust than median, since early speech
+    Reads `duration_s` seconds of audio (~12 chunks at 0.8s) and uses the
+    20th percentile of RMS values — more robust than median, since early speech
     or short outliers (single loud chunks) do not skew the value.
 
     Minimum: 40 (for very quiet environments).
-    Maximum: 400 (Deckel als Sicherheitsnetz).
+    Maximum: 250 (safety cap).
     """
     n_chunks = max(1, int(duration_s * SAMPLE_RATE / CHUNK_SIZE))
     rms_values = []
@@ -658,35 +667,35 @@ def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
             pass
     if not rms_values:
         return SILENCE_THRESHOLD
-    # 20. Perzentil: nimmt die leisesten 20% der Chunks → echter Silence-Floor
+    # 20th percentile: takes the quietest 20% of chunks → true silence floor
     # Median would be too high due to early speech.
     # Factor 4 (instead of 8): keeps threshold well below normal speech level (~150–400 RMS)
     noise_floor = float(np.percentile(rms_values, 20))
     dynamic = int(noise_floor * 4)
     dynamic = max(40, min(dynamic, 250))
-    log.info(f"  [2b] Kalibrierung: noise_floor(p20)={noise_floor:.1f} → threshold={dynamic} "
+    log.info(f"  [2b] Calibration: noise_floor(p20)={noise_floor:.1f} → threshold={dynamic} "
              f"(min={min(rms_values):.1f}, max={max(rms_values):.1f}, n={len(rms_values)})")
     return dynamic
 
 
 def record_with_silence_detection(audio_stream, threshold: int = None):
-    """Nimmt Audio auf bis Silence erkannt wird"""
+    """Record audio until silence is detected"""
     effective_threshold = threshold if threshold is not None else SILENCE_THRESHOLD
     frames = []
     silent_chunks = 0
-    # Berechnungen mit Whisper Sample-Rate (16kHz - Hardware macht Resampling)
+    # Calculations based on Whisper sample rate (16kHz)
     chunks_for_silence = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
     min_chunks = int(MIN_RECORD_SECONDS * SAMPLE_RATE / CHUNK_SIZE)
     max_chunks = int(MAX_RECORD_SECONDS * SAMPLE_RATE / CHUNK_SIZE)
-    # Warmup: Silence-Counter starting erst nach 1.5s.
-    # Gibt dem Device Zeit zum Stabilisieren UND stellt sicher dass der
-    # Silence timer never runs before user hears the start sound.
+    # Warmup: silence counter only starts after 1.5s.
+    # Gives the device time to stabilize AND ensures the
+    # silence timer never runs before user hears the start sound.
     warmup_chunks = int(1.5 * SAMPLE_RATE / CHUNK_SIZE)
     total_chunks = 0
 
     while total_chunks < max_chunks:
         try:
-            # Lese 16kHz chunks (Hardware-Resampling von 48kHz)
+            # Read 16kHz chunks
             data = _read_chunk(audio_stream, CHUNK_SIZE)
             frames.append(data)
             total_chunks += 1
@@ -705,25 +714,25 @@ def record_with_silence_detection(audio_stream, threshold: int = None):
                 break
 
         except Exception as e:
-            print(f"  Audio-Error: {e}")
+            print(f"  Audio error: {e}")
             break
 
     return frames
 
 
 def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
-    """Nimmt Audio auf mit silero-vad Voice Activity Detection.
+    """Record audio with silero-vad Voice Activity Detection.
 
-    Liest 512-Sample Chunks (32ms bei 16kHz), analysiert jeden per silero-vad.
-    Stoppt wenn nach erkannter Sprache VAD_MIN_SILENCE_MS Silence folgt.
+    Reads 512-sample chunks (32ms at 16kHz), analyzes each via silero-vad.
+    Stops when VAD_MIN_SILENCE_MS of silence follows detected speech.
     Returns all recorded bytes (incl. pre-speech frames) for Whisper.
-    
+
     ptt_mode: If True, stop when _ptt_stop_requested becomes True (key released).
 
-    State-Machine:
-        WAITING  → warte auf erste Sprache (aber akkumuliere Audio)
-        SPEAKING → Speech detected, silence counter running
-        STOPPED  → Silence-Timeout erreicht (or PTT key released)
+    State machine:
+        WAITING  → waiting for first speech (but accumulating audio)
+        SPEAKING → speech detected, silence counter running
+        STOPPED  → silence timeout reached (or PTT key released)
     """
     import torch
     global _ptt_stop_requested
@@ -736,8 +745,8 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
     max_total_chunks      = int(MAX_RECORD_SECONDS * 1000 / ms_per_chunk)
 
     frames          = []
-    speech_chunks   = 0   # konsekutive Sprach-Chunks
-    silence_streak  = 0   # konsekutive Silence-Chunks nach Sprachbeginn
+    speech_chunks   = 0   # consecutive speech chunks
+    silence_streak  = 0   # consecutive silence chunks after speech start
     speech_started  = False
     total_chunks    = 0
 
@@ -745,7 +754,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
         # PTT mode: stop immediately when key released
         if ptt_mode and _ptt_stop_requested:
             elapsed_ms = total_chunks * ms_per_chunk
-            log.info(f"  PTT: 🛑 Key released → Stopp (t={elapsed_ms:.0f}ms)")
+            log.info(f"  PTT: 🛑 Key released → stop (t={elapsed_ms:.0f}ms)")
             break
         try:
             data = _read_chunk(audio_stream, vad_chunk)
@@ -780,7 +789,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
                 if (total_chunks >= min_total_chunks and
                         silence_streak >= silence_chunks_needed):
                     elapsed_ms = total_chunks * ms_per_chunk
-                    log.debug(f"  VAD: 🤫 Silence {silence_streak * ms_per_chunk:.0f}ms → Stopp "
+                    log.debug(f"  VAD: 🤫 Silence {silence_streak * ms_per_chunk:.0f}ms → stop "
                               f"(t={elapsed_ms:.0f}ms)")
                     break
 
@@ -1187,108 +1196,129 @@ def _start_control_server():
     threading.Thread(target=_control_server_loop, daemon=True).start()
 
 
-def _watch_loop():
-    """Background watch listener with segment-final trigger execution.
+def _watch_transcription_worker():
+    """Background thread: dequeues audio segments, transcribes, matches triggers."""
+    while not should_exit:
+        try:
+            audio_np = _watch_transcribe_queue.get(timeout=1.0)
+        except _queue_mod.Empty:
+            continue
 
-    Phase A: Build speech segments from live chunks and finalize on silence.
-    Phase B: Detect intent, then collect follow-up text until idle.
-    Phase C: Execute action once on finalized collected text.
+        # Transcribe
+        try:
+            if engine_type == "api":
+                text, _lang = transcribe_via_api(audio_np)
+            elif engine_type == "faster":
+                text, _lang = transcribe_faster_whisper(audio_np)
+            elif model is not None:
+                text, _lang = transcribe_openai_whisper(audio_np)
+            else:
+                text = ""
+        except Exception as ex:
+            log.warning(f"  [watch-worker] transcribe failed: {ex}")
+            continue
+
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        duration_s = len(audio_np) / SAMPLE_RATE
+        log.info(f"  [watch] transcribed ({duration_s:.1f}s): {text[:180]}")
+
+        # Match trigger — single-segment, no accumulation
+        trig, phrase = _match_trigger(text.lower(), source="watch")
+        if trig is None:
+            continue
+
+        name = trig.get("name", "<unnamed>")
+        log.info(f"  [watch] trigger matched: '{name}' (phrase='{phrase}')")
+
+        # Build payload: strip the command phrase from the text
+        payload = text
+        if name == "type_to_active":
+            payload = re.sub(_PAT_TYPE_TO_ACTIVE, "", text, count=1,
+                             flags=re.IGNORECASE).strip(" ,.!?;:-")
+        elif name == "type_to_telegram":
+            payload = re.sub(_PAT_TYPE_TO_TELEGRAM, "", text, count=1,
+                             flags=re.IGNORECASE).strip(" ,.!?;:-")
+        else:
+            if phrase:
+                idx = text.lower().find(phrase)
+                if idx >= 0:
+                    payload = (text[:idx] + text[idx + len(phrase):]).strip(" ,.!?;:-")
+
+        # Typing triggers need actual payload text
+        if not payload and name in ("type_to_telegram", "type_to_active"):
+            log.info(f"  [watch] trigger '{name}' skipped (empty payload)")
+            continue
+        if not payload:
+            payload = text
+
+        # Cooldown check
+        now = time.time()
+        last = _trigger_last_fire.get(name, 0)
+        if (now - last) * 1000 < ACTION_COOLDOWN_MS:
+            log.debug(f"  [watch] trigger '{name}' cooldown active")
+            continue
+        _trigger_last_fire[name] = now
+
+        # Execute
+        ok, msg = _run_action_trigger(trig, payload, raw_text=text)
+        if ok:
+            log.info(f"  [watch] action OK: {name} | '{payload[:120]}'")
+        else:
+            log.warning(f"  [watch] action FAIL: {name}: {msg}")
+
+
+def _watch_loop():
+    """Background watch loop: VAD-based speech segmentation, non-blocking transcription.
+
+    Reads 512-sample chunks (32ms), runs silero-vad to detect speech boundaries.
+    When a speech segment ends (VAD silence >= WATCH_SILENCE_MS), the audio
+    is enqueued for background transcription. The watch loop never blocks on
+    Whisper — it keeps reading audio continuously.
     """
     global WATCH_ACTIVE, WATCH_UNTIL_TS, _audio_stream
+    import torch
 
-    silence_s = max(0.3, WATCH_SILENCE_MS / 1000.0)
-    max_segment_s = max(2.0, WATCH_MAX_SEGMENT_MS / 1000.0)
-    intent_idle_s = max(0.6, WATCH_INTENT_IDLE_MS / 1000.0)
+    vad_chunk = VAD_CHUNK_SAMPLES  # 512 samples = 32ms
+    silence_chunks_needed = max(1, int(WATCH_SILENCE_MS / 32))
+    max_segment_chunks = max(1, int(WATCH_MAX_SEGMENT_MS / 32))
+    min_segment_chunks = max(1, int(WATCH_MIN_SEGMENT_MS / 32))
 
-    pre_chunks = []
-    pre_max = 8  # ~256ms at 32ms chunks
+    # Start transcription worker thread
+    threading.Thread(target=_watch_transcription_worker, daemon=True).start()
 
+    # Segment state
     in_segment = False
     segment_frames = []
-    segment_start_ts = 0.0
-    last_speech_ts = 0.0
-
-    intent = None  # {"trig":..., "phrase":..., "name":..., "collected":str, "last_update":ts}
-
-    def _transcribe_np(audio_np):
-        if engine_type == "api":
-            return transcribe_via_api(audio_np)
-        if engine_type == "faster":
-            return transcribe_faster_whisper(audio_np)
-        if model is None:
-            return "", ""
-        return transcribe_openai_whisper(audio_np)
-
-    def _append_to_intent(text, now_ts):
-        nonlocal intent
-        if intent is None:
-            return
-        intent["collected"] = (intent["collected"] + " " + text).strip()
-        intent["last_update"] = now_ts
-
-    def _finalize_intent_if_due(now_ts):
-        nonlocal intent
-        if intent is None:
-            return
-        if now_ts - intent["last_update"] < intent_idle_s:
-            return
-
-        full_text = intent.get("collected", "").strip()
-        trig = intent.get("trig")
-        name = intent.get("name", "<unnamed>")
-        if not full_text or not trig:
-            intent = None
-            return
-
-        # Build payload without keyword phrase (keep text before+after keyword).
-        payload = full_text
-        if name == "type_to_active":
-            payload = re.sub(_PAT_TYPE_TO_ACTIVE, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
-        elif name == "type_to_telegram":
-            payload = re.sub(_PAT_TYPE_TO_TELEGRAM, "", full_text, count=1, flags=re.IGNORECASE).strip(" ,.!?;:-")
-        else:
-            phrase = intent.get("phrase")
-            if phrase and phrase != "__telegram_intent__" and phrase != "__active_intent__":
-                idx = full_text.lower().find(phrase)
-                if idx >= 0:
-                    payload = (full_text[:idx] + full_text[idx + len(phrase):]).strip(" ,.!?;:-")
-
-        if not payload:
-            # Typing triggers need actual text — discard if nothing to type.
-            # Command-only triggers (disable_watch, extend_watch_5m, …) run without payload.
-            if name in ("type_to_telegram", "type_to_active"):
-                log.info(f"  [watch] finalize intent '{name}' skipped (empty payload)")
-                intent = None
-                return
-            payload = full_text  # use full spoken text as env var for command triggers
-
-        ok, msg = _run_action_trigger(trig, payload, raw_text=full_text)
-        if ok:
-            log.info(f"  [action:watch-final] ✅ {name} | payload='{payload[:160]}'")
-        else:
-            log.warning(f"  [action:watch-final] ❌ {name}: {msg}")
-        intent = None
+    segment_chunk_count = 0
+    silence_streak = 0
 
     while not should_exit:
         now = time.time()
 
+        # Duration expiry
         if WATCH_UNTIL_TS and now >= WATCH_UNTIL_TS:
             WATCH_ACTIVE = False
             WATCH_UNTIL_TS = None
 
+        # Suspend/inactive: discard partial segment, sleep briefly
         if (not WATCH_ACTIVE) or _recording_lock.locked() or WATCH_SUSPENDED:
-            _finalize_intent_if_due(now)
+            if in_segment:
+                in_segment = False
+                segment_frames = []
+                segment_chunk_count = 0
+                silence_streak = 0
+                log.debug("  [watch] segment discarded (suspended)")
             time.sleep(0.05)
             continue
 
+        # Ensure stream is open and active
         try:
             _cancel_idle_close_timer()
             _open_audio_stream()
             if _audio_stream.is_stopped():
-                # close() + fresh open() so PipeWire re-activates BT HFP mic.
-                # start_stream() on an already-opened stopped stream does NOT
-                # trigger PipeWire to re-activate the Bluetooth HFP profile,
-                # so the stream would return zeros and no speech is detected.
                 try:
                     _audio_stream.close()
                 except Exception:
@@ -1296,95 +1326,81 @@ def _watch_loop():
                 _audio_stream = None
                 _open_audio_stream()
 
-            data = _read_chunk(_audio_stream, VAD_CHUNK_SAMPLES)
-            chunk_i16 = np.frombuffer(data, dtype=np.int16)
-            chunk_rms = get_rms(chunk_i16.tobytes())
-            is_speech = chunk_rms > WATCH_RMS_THRESHOLD
-
-            pre_chunks.append(data)
-            if len(pre_chunks) > pre_max:
-                pre_chunks = pre_chunks[-pre_max:]
-
-            if is_speech:
-                last_speech_ts = now
-                if not in_segment:
-                    in_segment = True
-                    segment_start_ts = now
-                    segment_frames = list(pre_chunks)
-                segment_frames.append(data)
-            elif in_segment:
-                segment_frames.append(data)
-
-            # finalize segment on silence or max duration
-            seg_elapsed = (now - segment_start_ts) if in_segment else 0.0
-            silence_elapsed = (now - last_speech_ts) if in_segment else 0.0
-            if in_segment and (silence_elapsed >= silence_s or seg_elapsed >= max_segment_s):
-                cut_by_max = seg_elapsed >= max_segment_s and silence_elapsed < silence_s
-                in_segment = False
-                if segment_frames:
-                    audio_data = b"".join(segment_frames)
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                    segment_frames = []
-
-                    try:
-                        text, _lang = _transcribe_np(audio_np)
-                    except Exception as ex:
-                        log.warning(f"  [watch] transcribe failed: {ex}")
-                        text = ""
-
-                    text = (text or "").strip()
-                    if text:
-                        log.info(f"  [watch-final] 📝 {text[:180]}")
-                        # Start or extend intent collection
-                        if intent is None:
-                            trig, phrase = _match_trigger(text.lower(), source="watch")
-                            if trig is not None:
-                                intent = {
-                                    "trig": trig,
-                                    "phrase": phrase,
-                                    "name": trig.get("name", "<unnamed>"),
-                                    "collected": text,
-                                    "last_update": time.time(),
-                                }
-                                log.info(f"  [watch-final] intent='{intent['name']}' detected")
-                        else:
-                            _append_to_intent(text, time.time())
-                            log.info(f"  [watch-final] intent collect += '{text[:120]}'")
-
-                    # If segment was cut by max-duration (not by silence), user is likely
-                    # still speaking — restart segment capture so intent idle timer doesn't
-                    # fire during the transcription gap.
-                    if cut_by_max:
-                        t_now = time.time()
-                        in_segment = True
-                        segment_start_ts = t_now
-                        last_speech_ts = t_now
-                        segment_frames = []
-                        log.debug("  [watch] max-cut: restarting segment (speech ongoing)")
-
-            # Only finalize when no segment is active — a mid-sentence natural pause
-            # of >intent_idle_ms would otherwise fire the intent against the previous
-            # segment's timestamp while the user is still speaking.
-            if not in_segment:
-                _finalize_intent_if_due(now)
-
+            data = _read_chunk(_audio_stream, vad_chunk)
         except Exception as ex:
             msg = str(ex)
             if "-9988" in msg or "Stream closed" in msg or "-9983" in msg:
                 try:
                     if _audio_stream is not None:
-                        try:
-                            _audio_stream.close()
-                        except Exception:
-                            pass
-                    _audio_stream = None
+                        _audio_stream.close()
                 except Exception:
                     pass
-                log.warning("  [watch] stream closed -> recovering")
+                _audio_stream = None
+                log.warning("  [watch] stream error -> recovering")
                 time.sleep(0.35)
                 continue
-            log.warning(f"  [watch] loop error: {ex}")
+            log.warning(f"  [watch] read error: {ex}")
             time.sleep(0.2)
+            continue
+
+        # VAD inference (silero-vad, < 1ms on CPU)
+        audio_f32 = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        with torch.no_grad():
+            speech_prob = _vad_model(torch.from_numpy(audio_f32), SAMPLE_RATE).item()
+        is_speech = speech_prob >= VAD_THRESHOLD
+
+        if is_speech:
+            silence_streak = 0
+            if not in_segment:
+                in_segment = True
+                segment_frames = []
+                segment_chunk_count = 0
+                log.debug(f"  [watch] speech start (prob={speech_prob:.2f})")
+            segment_frames.append(data)
+            segment_chunk_count += 1
+        elif in_segment:
+            # Keep silence tail for Whisper context
+            segment_frames.append(data)
+            segment_chunk_count += 1
+            silence_streak += 1
+
+        # Check segment end conditions
+        segment_done = False
+        if in_segment:
+            if silence_streak >= silence_chunks_needed:
+                segment_done = True
+                log.debug(f"  [watch] speech end (silence {silence_streak * 32}ms)")
+            elif segment_chunk_count >= max_segment_chunks:
+                segment_done = True
+                log.debug(f"  [watch] speech end (max duration {WATCH_MAX_SEGMENT_MS}ms)")
+
+        if segment_done:
+            in_segment = False
+            silence_streak = 0
+
+            # Skip segments that are too short (noise bursts)
+            if segment_chunk_count < min_segment_chunks:
+                log.debug(f"  [watch] segment too short ({segment_chunk_count * 32}ms), discarded")
+                segment_frames = []
+                segment_chunk_count = 0
+                continue
+
+            # Convert to float32 and enqueue for background transcription
+            audio_data = b"".join(segment_frames)
+            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            segment_frames = []
+            segment_chunk_count = 0
+
+            try:
+                _watch_transcribe_queue.put_nowait(audio_np)
+            except _queue_mod.Full:
+                log.warning("  [watch] transcription queue full, segment dropped")
+
+            # Reset VAD state after segment to avoid LSTM state leakage
+            try:
+                _vad_model.reset_states()
+            except Exception:
+                pass
 
 
 def _start_watch_thread():
@@ -1392,16 +1408,16 @@ def _start_watch_thread():
 
 
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
-    """Hauptfunktion: Aufnehmen → Transcribingn → Typing
+    """Main function: Record → Transcribe → Type
 
     ptt_mode: If True, Push-to-Talk mode (stop on key release, send with Enter)
     skip_start_sound: If True, start sound was already played (PTT mode)
     """
     global _ptt_stop_requested, WATCH_SUSPENDED, WATCH_ACTIVE
 
-    # Lock statt bool: verhindert Race-Condition bei schnell-mehrfachem Hotkey
+    # Lock instead of bool: prevents race condition on rapid hotkey presses
     if not _recording_lock.acquire(blocking=False):
-        log.debug("Hotkey ignored — Recording already running (Lock gehalten)")
+        log.debug("Hotkey ignored — recording already running (lock held)")
         return
 
     # Reset PTT stop flag
@@ -1441,37 +1457,37 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     _cancel_idle_close_timer()
     _open_audio_stream()
 
-    # ── 1. Stream-Status checkingn & starten ──────────────────────
+    # ── 1. Check stream status & start ─────────────────────────────
     stream_active = _audio_stream.is_active() if _audio_stream else False
     stream_stopped = _audio_stream.is_stopped() if _audio_stream else True
     log.info(f"  [1] Stream status before start: active={stream_active}, stopped={stream_stopped}")
-    log.info(f"  [1] Input-Device: {_mic_device_info()}")
+    log.info(f"  [1] Input device: {_mic_device_info()}")
 
     try:
         _audio_stream.start_stream()
         log.info(f"  [1] start_stream() OK → active={_audio_stream.is_active()}")
     except Exception as e:
-        log.error(f"  [1] ❌ start_stream() FEHLER: {e}")
-        notify("❌ Audio-Error", str(e), "critical")
+        log.error(f"  [1] ❌ start_stream() failed: {e}")
+        notify("❌ Audio error", str(e), "critical")
         return
 
-    # ── 2. Device-Readiness checkingn (Bluetooth-Reconnect abwarten) ──
-    log.info(f"  [2] Checking ob Microphone real data delivers...")
+    # ── 2. Device readiness check (wait for Bluetooth reconnect) ───
+    log.info(f"  [2] Checking if microphone delivers real data...")
     mic_ready = _check_mic_ready(max_wait_s=3.0)
     log.info(f"  [2] Mic-Ready: {mic_ready} | Device: {_mic_device_info()}")
 
     if not mic_ready:
-        log.warning("  [2] Mic not ready — versuche Stream to reopen...")
+        log.warning("  [2] Mic not ready — attempting stream reopen...")
         try:
             _audio_stream.stop_stream()
             _audio_stream.close()
             _audio_stream = None
             _open_audio_stream()
-            log.info("  [2] Stream neu opened — second Readiness-Check...")
+            log.info("  [2] Stream reopened — second readiness check...")
             mic_ready = _check_mic_ready(max_wait_s=2.0)
-            log.info(f"  [2] Zweiter check: mic_ready={mic_ready}")
+            log.info(f"  [2] Second check: mic_ready={mic_ready}")
         except Exception as e:
-            log.error(f"  [2] ❌ Stream-Neustart failed: {e}")
+            log.error(f"  [2] ❌ Stream restart failed: {e}")
             notify("❌ Mic not ready", f"Mic error: {e}", "critical")
             play_sound("mic_error")
             return
@@ -1501,7 +1517,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         except Exception:
             break
 
-    # ── 2d. Kalibrierung (nur RMS-Fallback) ──────────────────────
+    # ── 2d. Calibration (RMS fallback only) ──────────────────────
     use_vad = VAD_ENABLED and _vad_model is not None
     if not use_vad:
         dynamic_threshold = calibrate_silence_threshold(_audio_stream)
@@ -1531,7 +1547,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         elapsed_record = time.time() - record_start_ts
         try:
             _audio_stream.stop_stream()
-            log.info(f"  [4] ⏹  Stream stopped nach {elapsed_record:.2f}s | active={_audio_stream.is_active()}")
+            log.info(f"  [4] ⏹  Stream stopped after {elapsed_record:.2f}s | active={_audio_stream.is_active()}")
         except Exception as ex:
             log.warning(f"  [4] stop_stream() Error: {ex}")
         finally:
@@ -1547,18 +1563,18 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         notify("⚠️ No recording", "No audio data")
         return
 
-    # ── 6. Audio auswerten ───────────────────────────────────────
+    # ── 6. Analyze audio ────────────────────────────────────────
     audio_data = b''.join(frames)
     audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
     duration = len(audio_np) / SAMPLE_RATE
     rms_overall = float(np.sqrt(np.mean(audio_np ** 2))) * 32768
-    log.info(f"  [6] Audio: {duration:.2f}s, {len(frames)} Chunks, RMS_gesamt={rms_overall:.1f}")
+    log.info(f"  [6] Audio: {duration:.2f}s, {len(frames)} chunks, RMS_total={rms_overall:.1f}")
 
     if duration < 0.5:
         log.warning("  [6] Recording too short (<0.5s) — discarded")
         return
 
-    # ── 7. Transkription ─────────────────────────────────────────
+    # ── 7. Transcription ─────────────────────────────────────────
     log.info(f"  [7] Transcribing ({duration:.1f}s Audio, engine={engine_type})...")
     t0 = time.time()
     try:
@@ -1570,12 +1586,12 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
             text, lang = transcribe_openai_whisper(audio_np)
         elapsed_trans = time.time() - t0
     except Exception as e:
-        log.error(f"  [7] ❌ Transkriptions-Error: {e}")
+        log.error(f"  [7] ❌ Transcription error: {e}")
         notify("❌ Error", str(e), "critical")
         return
 
     if not text:
-        log.warning(f"  [7] No speech detected (Dauer={duration:.1f}s, RMS={rms_overall:.1f})")
+        log.warning(f"  [7] No speech detected (duration={duration:.1f}s, RMS={rms_overall:.1f})")
         notify("⚠️ No text", "No speech detected")
         return
 
@@ -1606,7 +1622,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
 
 def listen_keyboard_hotkey(hotkey):
-    """Horcht auf globalen Hotkey via pynput"""
+    """Listen for global hotkey via pynput"""
     try:
         from pynput import keyboard
 
@@ -1647,7 +1663,7 @@ def listen_keyboard_hotkey(hotkey):
         is_altgr_hotkey = hotkey_norm in ('ALT_GR', 'ALTGR', 'RIGHT_ALT', 'RALT')
         
         if not target_key and not is_altgr_hotkey:
-            print(f"  ❌ Unbekannter Hotkey: {hotkey}")
+            print(f"  ❌ Unknown hotkey: {hotkey}")
             print(f"     Available: {', '.join(sorted(set(key_map.keys())))}")
             sys.exit(1)
 
@@ -1744,8 +1760,8 @@ def listen_keyboard_hotkey(hotkey):
                 thread.start()
 
         print(f"  🎹 Hotkey: {hotkey}")
-        print(f"  📍 Methode: pynput (global keyboard listener)")
-        print(f"  📍 PTT-Modus: Taste ≥300ms halten = Push-to-Talk")
+        print(f"  📍 Method: pynput (global keyboard listener)")
+        print(f"  📍 PTT mode: hold key ≥300ms = Push-to-Talk")
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
@@ -1757,9 +1773,9 @@ def listen_keyboard_hotkey(hotkey):
 
 
 def listen_xbindkeys_hotkey(hotkey):
-    """Fallback: Enter-basiert"""
-    print(f"  ⚠️  pynput nicht installiert.")
-    print(f"  Installiere: pip install pynput")
+    """Fallback: Enter-based input"""
+    print(f"  ⚠️  pynput not installed.")
+    print(f"  Install: pip install pynput")
     print()
 
     while not should_exit:
@@ -1781,26 +1797,27 @@ def main():
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
-    global WATCH_CHUNK_WINDOW_MS, WATCH_CHUNK_HOP_MS, WATCH_PARTIAL_FLUSH_MS, WATCH_RMS_THRESHOLD
-    global WATCH_MAX_SEGMENT_MS, WATCH_INTENT_IDLE_MS, WATCH_SILENCE_MS
+    global WATCH_MAX_SEGMENT_MS, WATCH_SILENCE_MS, WATCH_MIN_SEGMENT_MS
 
-    # ── Config File laden (Defaults) ─────────────────────────────
+    # ── Load config file (defaults) ──────────────────────────────
     cfg = load_config()
     rec = cfg.get("recording", {})
     vad = cfg.get("vad", {})
     sounds = cfg.get("sounds", {})
     api_cfg = cfg.get("api", {})
     watch_cfg = cfg.get("watch", {})
-    trans_cfg = cfg.get("transcription", {})
     actions_cfg = cfg.get("actions", {})
 
     # Input device override from [recording] section
     if rec.get("device") is not None:
-        INPUT_DEVICE_INDEX = int(rec["device"])
+        try:
+            INPUT_DEVICE_INDEX = int(rec["device"])
+        except (ValueError, TypeError):
+            log.warning(f"  Config: invalid device value '{rec['device']}', using auto-detect")
 
     # Config values as defaults (CLI overrides these)
     if vad.get("enabled") is not None:    VAD_ENABLED        = vad["enabled"]
-    if vad.get("threshold"):              VAD_THRESHOLD      = float(vad["threshold"])
+    if vad.get("threshold") is not None:  VAD_THRESHOLD      = float(vad["threshold"])
     if vad.get("min_silence_ms"):         VAD_MIN_SILENCE_MS = int(vad["min_silence_ms"])
     if sounds.get("start"):               CUSTOM_RECORD_START_SOUND = sounds["start"]
     if sounds.get("stop"):                CUSTOM_RECORD_END_SOUND   = sounds["stop"]
@@ -1815,27 +1832,6 @@ def main():
             pass
     WATCH_ACTIVE = IDLE_CLOSE_SECONDS > 0
 
-    if trans_cfg.get("chunk_window_ms") is not None:
-        try:
-            WATCH_CHUNK_WINDOW_MS = int(trans_cfg["chunk_window_ms"])
-        except Exception:
-            pass
-    if trans_cfg.get("chunk_hop_ms") is not None:
-        try:
-            WATCH_CHUNK_HOP_MS = int(trans_cfg["chunk_hop_ms"])
-        except Exception:
-            pass
-    if trans_cfg.get("partial_flush_ms") is not None:
-        try:
-            WATCH_PARTIAL_FLUSH_MS = int(trans_cfg["partial_flush_ms"])
-        except Exception:
-            pass
-
-    if watch_cfg.get("rms_threshold") is not None:
-        try:
-            WATCH_RMS_THRESHOLD = int(watch_cfg["rms_threshold"])
-        except Exception:
-            pass
     if watch_cfg.get("max_segment_ms") is not None:
         try:
             WATCH_MAX_SEGMENT_MS = int(watch_cfg["max_segment_ms"])
@@ -1844,12 +1840,11 @@ def main():
     if watch_cfg.get("silence_ms") is not None:
         try:
             WATCH_SILENCE_MS = int(watch_cfg["silence_ms"])
-        except (ValueError, TypeError):
+        except Exception:
             pass
-
-    if watch_cfg.get("intent_idle_ms") is not None:
+    if watch_cfg.get("min_segment_ms") is not None:
         try:
-            WATCH_INTENT_IDLE_MS = int(watch_cfg["intent_idle_ms"])
+            WATCH_MIN_SEGMENT_MS = int(watch_cfg["min_segment_ms"])
         except Exception:
             pass
 
@@ -1867,16 +1862,16 @@ def main():
         description='OkaWhisp - System-Level Voice Input',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Beispiele:
-  python okawhisp.py                                       # Standard (AltGr, medium, deutsch)
-  python okawhisp.py --model small --language en           # Englisch, schneller
+Examples:
+  python okawhisp.py                                       # Default (AltGr, medium, German)
+  python okawhisp.py --model small --language en           # English, faster
   python okawhisp.py --engine api --api-key sk-...         # OpenAI API
   python okawhisp.py --engine api \\
-    --api-url https://api.groq.com/openai/v1 --api-key gsk_  # Groq (kostenlos, schnell)
-  python voice-type.py --prompt "NestJS, Flutter, API"       # Fachbegriffe als Kontext
-  python voice-type.py --beam-size 1                         # Schneller, etwas ungenauer
+    --api-url https://api.groq.com/openai/v1 --api-key gsk_  # Groq (free, fast)
+  python okawhisp.py --prompt "NestJS, Flutter, API"        # Technical terms as context
+  python okawhisp.py --beam-size 1                          # Faster, slightly less accurate
 
-Config File: ~/.config/voice-type/config.toml
+Config file: ~/.config/okawhisp/config.toml
         """
     )
     parser.add_argument('--key', default=rec.get('key', 'ALT_GR'),
@@ -1884,18 +1879,18 @@ Config File: ~/.config/voice-type/config.toml
     parser.add_argument('--model', default=rec.get('model', 'medium'),
                         help='Whisper Model: tiny/base/small/medium/large-v3 (default: medium)')
     parser.add_argument('--language', default=rec.get('language', 'de'),
-                        help='Language: de/en/fr/es/... oder "auto" (default: de)')
+                        help='Language: de/en/fr/es/... or "auto" (default: de)')
     parser.add_argument('--engine', default=rec.get('engine', 'faster'),
                         choices=['faster', 'openai', 'api'],
-                        help='Engine: faster | openai (lokal) | api (OpenAI-kompatibel)')
+                        help='Engine: faster | openai (local) | api (OpenAI-compatible)')
     parser.add_argument('--beam-size', type=int, default=rec.get('beam_size', 5),
                         help='Beam search size: 1=fast, 5=accurate (default: 5)')
     parser.add_argument('--prompt', default=rec.get('prompt', None),
                         help='Context prompt for better recognition of technical terms')
     parser.add_argument('--silence', type=float, default=rec.get('silence', 2.0),
-                        help='Silence-Dauer in Sekunden bis Auto-stop (default: 2.0)')
+                        help='Silence duration in seconds until auto-stop (default: 2.0)')
     parser.add_argument('--threshold', type=int, default=200,
-                        help='Silence-Schwellwert RMS (default: 200)')
+                        help='Silence RMS threshold (default: 200)')
     parser.add_argument('--api-url', default=None,
                         help='API base URL for engine=api (default: OpenAI)')
     parser.add_argument('--api-key', default=None,
@@ -1926,11 +1921,11 @@ Config File: ~/.config/voice-type/config.toml
     print("=" * 60)
     print()
     log.info("=" * 60)
-    log.info("🎤 OkaWhisp gestarting")
-    log.info(f"   Log-Datei: {LOG_FILE}")
+    log.info("🎤 OkaWhisp starting")
+    log.info(f"   Log file: {LOG_FILE}")
     log.info("=" * 60)
     log.info(f"  ⚙️  idle_auto_close_seconds={IDLE_CLOSE_SECONDS} | triggers={len(ACTION_TRIGGERS)}")
-    log.info(f"  ⚙️  watch transcription: window={WATCH_CHUNK_WINDOW_MS}ms hop={WATCH_CHUNK_HOP_MS}ms flush={WATCH_PARTIAL_FLUSH_MS}ms rms>{WATCH_RMS_THRESHOLD} max_seg={WATCH_MAX_SEGMENT_MS}ms silence={WATCH_SILENCE_MS}ms intent_idle={WATCH_INTENT_IDLE_MS}ms")
+    log.info(f"  ⚙️  watch: VAD-based | max_seg={WATCH_MAX_SEGMENT_MS}ms silence={WATCH_SILENCE_MS}ms min_seg={WATCH_MIN_SEGMENT_MS}ms")
 
     # Signal Handler
     def signal_handler(sig, frame):
@@ -1948,7 +1943,24 @@ Config File: ~/.config/voice-type/config.toml
     # and then tries start_stream() on a BT HFP stream that PipeWire won't re-activate.
     _start_control_server()
 
-    # GPU checkingn
+    # ── Pre-flight checks (before slow model loading) ─────────
+    # xdotool is essential for typing — check early, before spending time on model download.
+    try:
+        subprocess.run(['xdotool', '--version'], capture_output=True, check=True)
+        print(f"  ✅ xdotool available")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"  ❌ xdotool not found! Install via: sudo apt install xdotool")
+        sys.exit(1)
+
+    # Wayland warning — xdotool only works on X11
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland":
+        print(f"  ⚠️  Wayland detected — xdotool may not work for typing.")
+        print(f"     Consider using X11 session or ydotool for Wayland support.")
+        log.warning("  Wayland session detected — xdotool typing may fail")
+    print()
+
+    # GPU check
     device = "cpu"
     try:
         import torch
@@ -1957,11 +1969,11 @@ Config File: ~/.config/voice-type/config.toml
             gpu_name = torch.cuda.get_device_name(0)
             print(f"  🖥️  GPU: {gpu_name}")
         else:
-            print(f"  ⚠️  Keine CUDA GPU, nutze CPU")
+            print(f"  ⚠️  No CUDA GPU found, using CPU")
     except ImportError:
         if engine_type == "faster":
             device = "cuda"  # faster-whisper checks itself
-        print(f"  ⚠️  PyTorch not available, Engine entscheidet Device")
+        print(f"  ⚠️  PyTorch not available, engine decides device")
 
     # Check if whisper-server is already running (then no local loading needed)
     _server_available = False
@@ -1978,12 +1990,12 @@ Config File: ~/.config/voice-type/config.toml
         api_host = WHISPER_API_BASE_URL.split("/")[2] if "//" in WHISPER_API_BASE_URL else WHISPER_API_BASE_URL
         print(f"  🌐 API-Engine: {api_host} (Model: {WHISPER_API_MODEL})")
         if not WHISPER_API_KEY:
-            print(f"  ⚠️  Kein API-Key gesetzt — setze OPENAI_API_KEY oder --api-key")
+            print(f"  ⚠️  No API key set — set OPENAI_API_KEY or use --api-key")
     elif _server_available:
         print(f"  ✅ whisper-server reachable ({WHISPER_SERVER_URL}) — no local model needed")
         print(f"  🔗 Using server GPU for transcription")
     else:
-        # Whisper-Modell lokal laden
+        # Load Whisper model locally
         print(f"  📦 Loading Whisper model '{MODEL_SIZE}' ({engine_type} engine)...")
         if MODEL_SIZE in ["large-v3", "medium"]:
             print(f"     ⏳ First download: ~2-3 GB, this may take a few minutes...")
@@ -1997,7 +2009,7 @@ Config File: ~/.config/voice-type/config.toml
                 model = load_model_openai_whisper(MODEL_SIZE, device)
                 print(f"  ✅ openai-whisper loaded ({time.time() - load_start:.1f}s)")
         except Exception as e:
-            print(f"  ⚠️  GPU failed ({e}), versuche CPU...")
+            print(f"  ⚠️  GPU failed ({e}), trying CPU...")
             try:
                 if engine_type == "faster":
                     model = load_model_faster_whisper(MODEL_SIZE, "cpu")
@@ -2010,7 +2022,7 @@ Config File: ~/.config/voice-type/config.toml
 
     print()
 
-    # silero-vad laden
+    # Load silero-vad
     if VAD_ENABLED:
         print(f"  📦 Loading silero-vad model...")
         vad_start = time.time()
@@ -2043,20 +2055,12 @@ Config File: ~/.config/voice-type/config.toml
             print(f"skipped ({_we})")
     print()
 
-    # xdotool checkingn
-    try:
-        subprocess.run(['xdotool', '--version'], capture_output=True, check=True)
-        print(f"  ✅ xdotool available")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print(f"  ❌ xdotool nicht found! sudo apt install xdotool")
-        sys.exit(1)
-
     vad_status = f"silero-vad (threshold={VAD_THRESHOLD}, silence={VAD_MIN_SILENCE_MS}ms)" \
                  if (VAD_ENABLED and _vad_model is not None) \
                  else f"RMS (threshold={SILENCE_THRESHOLD}, silence={SILENCE_DURATION}s)"
     print()
     print("─" * 60)
-    print(f"  ⚙️  Konfiguration:")
+    print(f"  ⚙️  Configuration:")
     if engine_type == "api":
         api_host = WHISPER_API_BASE_URL.split("/")[2] if "//" in WHISPER_API_BASE_URL else WHISPER_API_BASE_URL
         print(f"     Engine:      api  ({api_host})")
@@ -2066,35 +2070,35 @@ Config File: ~/.config/voice-type/config.toml
         print(f"     Model:      {MODEL_SIZE}")
         print(f"     Beam Size:   {BEAM_SIZE}")
     print(f"     Language:     {LANGUAGE or 'auto-detect'}")
-    print(f"     Prompt:      {INITIAL_PROMPT or '(keiner)'}")
+    print(f"     Prompt:      {INITIAL_PROMPT or '(none)'}")
     print(f"     VAD:         {vad_status}")
-    print(f"     Max Dauer:   {MAX_RECORD_SECONDS}s")
+    print(f"     Max duration: {MAX_RECORD_SECONDS}s")
     print("─" * 60)
     print()
 
-    # PyAudio-Instanz + Stream warm starten; nach 60s idle wieder schließen.
+    # PyAudio instance + stream warm start; close again after 60s idle.
     global _pyaudio_instance, _audio_stream
     try:
         _open_audio_stream()
         _audio_stream.stop_stream()  # warm start, no active capture
         dev_info = _mic_device_info()
-        print(f"  ✅ PyAudio + Input-Stream initialisiert (warm start, idle-close={IDLE_CLOSE_SECONDS}s)")
-        log.info(f"  ✅ PyAudio initialisiert | Input-Device: {dev_info}")
+        print(f"  ✅ PyAudio + input stream initialized (warm start, idle-close={IDLE_CLOSE_SECONDS}s)")
+        log.info(f"  ✅ PyAudio initialized | Input device: {dev_info}")
         _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="startup-idle")
     except Exception as e:
-        log.error(f"  ❌ Audio-Initialisierung failed: {e}")
-        print(f"  ❌ Audio-Initialisierung failed: {e}")
+        log.error(f"  ❌ Audio initialization failed: {e}")
+        print(f"  ❌ Audio initialization failed: {e}")
         sys.exit(1)
 
-    # Hotkey-Listener starten
-    print("  🔊 Starte Hotkey-Listener...")
+    # Start hotkey listener
+    print("  🔊 Starting hotkey listener...")
     print()
     print("  ┌─────────────────────────────────────────────────┐")
     print(f"  │  Press [{args.key}] to record                │")
     print(f"  │  Speak → Silence → Auto-stop → Type       │")
-    print(f"  │  Text wird ins activee Fenster getippt           │")
+    print(f"  │  Text is typed into the active window             │")
     print(f"  │                                                 │")
-    print(f"  │  Ctrl+C zum Beenden                             │")
+    print(f"  │  Ctrl+C to exit                                 │")
     print("  └─────────────────────────────────────────────────┘")
     print()
 
@@ -2111,17 +2115,17 @@ Config File: ~/.config/voice-type/config.toml
     if not listen_keyboard_hotkey(args.key):
         listen_xbindkeys_hotkey(args.key)
 
-    # Cleanup beim Beenden
+    # Cleanup on exit
     _cancel_idle_close_timer()
     if _audio_stream is not None:
         try:
             _audio_stream.close()
-        except:
+        except Exception:
             pass
     if _pyaudio_instance is not None:
         try:
             _pyaudio_instance.terminate()
-        except:
+        except Exception:
             pass
 
 
