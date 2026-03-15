@@ -3,11 +3,12 @@
 # All settings are optional — CLI arguments always override these values.
 
 [recording]
-key      = "F9"       # Hotkey: F1–F12
+key      = "F9"       # Hotkey: ALT_GR, F1–F12
 model    = "medium"   # Whisper model: tiny | base | small | medium | large-v3
 language = "de"       # Language code or "auto" for auto-detect
 engine   = "faster"   # faster | openai | api
 beam_size = 5         # 1 = fast, 5 = accurate
+# device = 15         # PyAudio device index override (None = auto-detect pulse)
 # prompt = "Python, FastAPI, TypeScript"  # domain hints for better accuracy
 
 [vad]
@@ -15,13 +16,9 @@ enabled        = true   # silero-vad for smart silence detection (recommended)
 threshold      = 0.5    # speech probability threshold (0.0–1.0)
 min_silence_ms = 2500   # ms of silence after speech before stopping
 
-[duck]
-enabled    = true  # reduce background audio during recording
-sink_level = 10    # target volume % (10 = quiet, 30 = still audible)
-
 [sounds]
-# start = "/path/to/start.mp3"  # custom start sound (optional)
-# stop  = "/path/to/stop.mp3"   # custom stop sound (optional)
+# start = "/path/to/start.wav"  # custom start sound (optional)
+# stop  = "/path/to/stop.wav"   # custom stop sound (optional)
 
 # ── API Engine (--engine api) ───────────────────────────────────
 # Use any OpenAI-compatible transcription API instead of a local model.
@@ -37,30 +34,38 @@ sink_level = 10    # target volume % (10 = quiet, 30 = still audible)
 # api_key  = "gsk_your_key_here"   # or set OPENAI_API_KEY env var
 # model    = "whisper-large-v3"
 
-# ── Extended Watch / Actions (MVP) ─────────────────────────────
+# ── Watch mode — always-on background listening ─────────────────
 [watch]
-idle_auto_close_seconds = 60
-rms_threshold = 10
-max_segment_ms = 10000
-intent_idle_ms = 1400
+idle_auto_close_seconds = 60   # close mic after idle period (0 = disable watch)
+max_segment_ms = 10000         # max length of a single watch segment
+silence_ms = 1200              # VAD silence after last speech to end segment
+min_segment_ms = 600           # minimum segment length to transcribe
 
-[transcription]
-chunk_window_ms = 1200
-chunk_hop_ms = 300
-partial_flush_ms = 1500
-
+# ── Actions — voice command triggers ─────────────────────────────
 [actions]
 keyword_debounce_ms = 1200
 action_cooldown_ms = 3000
 same_keyword_rearm_ms = 5000
 mode_switch_grace_ms = 500
+auto_prompt_from_triggers = false
 
+[[actions.triggers]]
+name = "disable_watch"
+match = ["stop listening", "mic off"]
+command = "okawhispctl"
+args = ["watch", "stop"]
 
 [[actions.triggers]]
 name = "extend_watch_5m"
 match = ["keep listening", "extend watch"]
 command = "okawhispctl"
 args = ["watch", "duration", "5m"]
+
+[[actions.triggers]]
+name = "type_here"
+match = ["type here", "write here"]
+command = "/bin/bash"
+args = ["-lc", "xdotool type --delay 5 --clearmodifiers \"$OKAWISP_TEXT\""]
 
 [[actions.triggers]]
 name = "type_to_telegram"

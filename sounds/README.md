@@ -1,13 +1,11 @@
 # Sound Files
 
-These sound files are used for recording start/stop feedback.
+Optional sound files for recording start/stop feedback.
+Played via `paplay` (PulseAudio/PipeWire) for correct audio routing.
 
-- **start.mp3**: Light switch click sound
-  - Source: [Freesound](https://freesound.org/)
-  - License: Creative Commons (check source for details)
+- **start.wav** / **start.mp3**: Recording start sound
+- **stop.wav** / **stop.mp3**: Recording stop sound
 
-- **stop.mp3**: iPhone screenshot sound
-  - Source: [Freesound](https://freesound.org/)
-  - License: Creative Commons (check source for details)
+WAV files are preferred (played directly by paplay). MP3 files are auto-converted to WAV via ffmpeg on first use.
 
-The script falls back to synthetic sounds if these files are not found.
+If no custom sound files are found, the script generates synthetic sounds (switch click for start, soft buzzer for stop).

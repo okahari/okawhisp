@@ -11,7 +11,7 @@ Type=simple
 # The installer (install.sh) generates the actual service file with correct paths.
 ExecStart=/usr/bin/env bash -c 'uv run ~/.local/share/okawhisp/okawhisp.py --key F9 --model large-v3 --engine faster --language de'
 
-# X11 + Audio Zugriff
+# X11 + Audio access
 Environment="DISPLAY=:1"
 Environment="XAUTHORITY=/home/okahari/.Xauthority"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
@@ -21,7 +21,7 @@ Environment="CUDA_VISIBLE_DEVICES=0"
 Restart=always
 RestartSec=5s
 
-# Ressourcen-Limits
+# Resource limits
 MemoryMax=4G
 MemoryHigh=3G
 

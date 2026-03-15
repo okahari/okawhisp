@@ -330,7 +330,7 @@ EOF
         ( journalctl --user -u okawhisp.service \
               --since "$START_TIME" -f -o cat 2>/dev/null | \
           grep --line-buffered -vE \
-              "^(Stopping|Stopped|Started|Failed|okawhisp\.service:)|={5,}|OkaWhisp (beendet|gestartet|- System)|Log-Datei:|Progress may not|^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | \
+              "^(Stopping|Stopped|Started|Failed|okawhisp\.service:)|={5,}|OkaWhisp (finished|starting|- System)|Log file:|Progress may not|^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}" | \
           while IFS= read -r line; do
               [ -n "$line" ] && printf "  %s\n" "$line"
           done ) &
@@ -345,7 +345,7 @@ EOF
             fi
             if journalctl --user -u okawhisp.service \
                     --since "$START_TIME" --no-pager -o cat 2>/dev/null | \
-               grep -qiE "(Starte Hotkey|🎹|Hotkey listener|PyAudio|Input-Stream)"; then
+               grep -qiE "(Starting hotkey|🎹|Hotkey listener|PyAudio initialized|input stream)"; then
                 READY=1
                 break
             fi

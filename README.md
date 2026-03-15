@@ -8,6 +8,7 @@ Press a hotkey → speak → text is typed into any focused window (terminal, br
 
 - **Push-to-Talk (PTT)**: Hold the key while speaking, release to transcribe & send
 - **Toggle mode**: Tap to start recording, silence auto-stops
+- **Watch mode**: Always-on background listening for trigger words (voice commands)
 
 Built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (4× faster than OpenAI Whisper) and [silero-vad](https://github.com/snakers4/silero-vad) for ML-based voice activity detection. Runs **100% locally** on your GPU or CPU — no cloud, no API keys, no data leaves your machine.
 
@@ -18,10 +19,41 @@ Built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (4× faster
 - 🎹 **Global hotkey** (AltGr default, F1–F12 configurable) — works in any window
 - 🎤 **Push-to-Talk + Toggle mode** — hold to talk or tap to start/stop
 - 🤫 **Smart auto-stop** via Voice Activity Detection (silero-vad)
-- 🔇 **Audio ducking** — background music fades during recording
+- 👂 **Watch mode** — always-on trigger word detection for voice commands
 - ⚡ **GPU-accelerated** (CUDA) with CPU fallback
+- 🔊 **Audio feedback** — start/stop sounds routed through PipeWire/PulseAudio
 - 🔄 **Systemd service** — runs in background, auto-restarts on crash
 - 🔒 **Offline & private** — no internet required after model download
+
+---
+
+## Dependencies
+
+### System packages
+
+```bash
+# Debian/Ubuntu
+sudo apt install xdotool portaudio19-dev python3-dev
+
+# Fedora
+sudo dnf install xdotool portaudio-devel python3-devel
+
+# Arch
+sudo pacman -S xdotool portaudio python
+```
+
+Optional: `paplay` (from `pulseaudio-utils` or PipeWire) for sound feedback.
+
+### Python packages
+
+```
+torch numpy pyaudio faster-whisper silero-vad pynput
+```
+
+Install via:
+```bash
+pip install --user torch numpy pyaudio faster-whisper silero-vad pynput
+```
 
 ---
 
@@ -30,6 +62,8 @@ Built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (4× faster
 ```bash
 curl -sSL https://github.com/okahari/okawhisp/raw/main/install.sh | bash
 ```
+
+The installer handles system packages, Python dependencies, model download, and systemd service setup automatically.
 
 ---
 
@@ -43,18 +77,28 @@ key = "ALT_GR"      # Alternatives: F1..F12
 model = "large-v3"
 language = "de"
 engine = "faster"
-beam_size = 5
-silence = 2.5
-prompt = ""         # Optional: "PostgreSQL, Kubernetes, Tailwind"
 
-[vad]
-enabled = true
-threshold = 0.5
-min_silence_ms = 2500
+[watch]
+idle_auto_close_seconds = 60   # 0 = disable watch mode
+max_segment_ms = 10000
+silence_ms = 1200
+min_segment_ms = 600
 
-[duck]
-enabled = true
+[sounds]
+# start = "/path/to/start.wav"   # custom start sound (optional)
+# stop  = "/path/to/stop.wav"    # custom stop sound (optional)
+
+[actions]
+action_cooldown_ms = 3000
+
+[[actions.triggers]]
+name = "type_here"
+match = ["type here", "write here"]
+command = "/bin/bash"
+args = ["-lc", "xdotool type --delay 5 --clearmodifiers \"$OKAWISP_TEXT\""]
 ```
+
+See `config.example.toml` for all available options.
 
 ---
 
@@ -74,14 +118,27 @@ CPU inference supported (int8). Use `tiny` or `base` for CPU-only systems.
 
 ## Usage
 
-Service starts automatically. Press **AltGr** (or your configured key) to record.
+Service starts automatically after install. Press **AltGr** (or your configured key) to record.
 
 ```bash
 # View logs
 journalctl --user -u okawhisp.service -f
 
+# Or check the log file directly
+tail -f ~/.local/share/okawhisp/okawhisp.log
+
 # Restart
 systemctl --user restart okawhisp.service
+```
+
+### Watch mode
+
+When enabled (default), okawhisp listens in the background for trigger words defined in `[[actions.triggers]]`. The microphone closes automatically after the idle timeout to preserve privacy.
+
+Use `okawhispctl` to control watch mode:
+```bash
+okawhispctl watch stop          # disable watch mode
+okawhispctl watch duration 5m   # extend watch for 5 minutes
 ```
 
 ---
@@ -90,9 +147,10 @@ systemctl --user restart okawhisp.service
 
 | Problem | Check |
 |---------|-------|
-| No audio | `pactl list sources short` |
-| Text not typed | `xdotool getactivewindow` |
-| No GPU | `python -c "import torch; print(torch.cuda.is_available())"` |
+| No audio input | `pactl list sources short` — verify your mic is listed |
+| Text not typed | `xdotool getactivewindow` — must be on X11 (not Wayland) |
+| No GPU | `python3 -c "import torch; print(torch.cuda.is_available())"` |
+| No start/stop sounds | Ensure `paplay` is installed (`pulseaudio-utils`) |
 
 ---
 
