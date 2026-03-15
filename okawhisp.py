@@ -45,7 +45,6 @@ import wave
 import logging
 import json
 import socket
-import shlex
 import re
 from pathlib import Path
 from datetime import datetime
@@ -92,10 +91,9 @@ log.addHandler(_ch)
 SAMPLE_RATE = 16000         # Whisper requires 16kHz
 CHUNK_SIZE = 1024           # ~64ms per chunk (at 16kHz)
 
-# Jabra Elite 65t device specifications
-DEVICE_SAMPLE_RATE = 48000  # Native Bluetooth microphone sample rate
-RESAMPLE_FACTOR = 3         # 48kHz / 16kHz = 3
-DEVICE_CHUNK_SIZE = CHUNK_SIZE * RESAMPLE_FACTOR  # = 3072 frames
+# Input device override (read from config.toml [recording] section).
+# None = auto-detect best PipeWire/PulseAudio device.
+INPUT_DEVICE_INDEX = None
 
 MODEL_SIZE = "medium"       # medium = best balance for RTX 3060 Ti
 LANGUAGE = "de"             # German as default (None = auto-detect)
@@ -116,10 +114,6 @@ VAD_MIN_SILENCE_MS = 2500   # Silence after last speech until auto-stop
 VAD_MIN_SPEECH_MS  = 200    # Minimum speech before stop counter activates
 VAD_CHUNK_SAMPLES  = 512    # silero requires exactly 512 samples at 16kHz (32ms)
 
-# Audio ducking: only regulate sink/master volume during recording.
-# We intentionally do NOT touch per-app sink-input volumes.
-DUCK_AUDIO_DURING_RECORDING = True
-DUCK_SINK_LEVEL = 0         # % to reduce sinks to while recording
 
 # Custom sounds (played if available)
 # Sounds: automatically loaded from ~/.local/share/okawhisp/sounds/ (by installer)
@@ -152,10 +146,6 @@ def load_config() -> dict:
         enabled = true
         threshold = 0.5
         min_silence_ms = 2500
-
-        [duck]
-        enabled = true
-        sink_level = 10
 
         [sounds]
         start = "/pfad/zu/start.mp3"
@@ -206,7 +196,6 @@ _idle_close_timer = None
 _idle_timer_lock = threading.Lock()
 
 CONTROL_SOCKET_PATH = str(Path.home() / ".local" / "share" / "okawhisp" / "control.sock")
-_control_server_thread = None
 
 WATCH_ACTIVE = True
 WATCH_UNTIL_TS = None
@@ -228,7 +217,6 @@ WATCH_RMS_THRESHOLD = 30
 WATCH_MAX_SEGMENT_MS = 10000
 WATCH_INTENT_IDLE_MS = 1400
 WATCH_SILENCE_MS     = 1200  # Silence after last speech to end a watch segment
-_watch_thread = None
 WATCH_SUSPENDED = False
 
 # ─── Trigger payload-extraction patterns (shared across watch + record paths) ──
@@ -438,70 +426,64 @@ def transcribe_via_api(audio_np):
 
 
 def _play_pcm_sound(samples, sample_rate=44100):
-    """Plays a short PCM signal directly via the default output device."""
+    """Plays a short PCM signal via paplay (routes through PipeWire correctly)."""
     if samples is None or len(samples) == 0:
         return False
 
     try:
         pcm = np.clip(samples, -1.0, 1.0)
-        pcm = (pcm * 32767).astype(np.int16).tobytes()
+        pcm_bytes = (pcm * 32767).astype(np.int16).tobytes()
 
-        audio = pyaudio.PyAudio()
-        stream = audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=sample_rate,
-            output=True,
+        # Write WAV to temp file and play via paplay
+        wav_path = os.path.join(os.path.dirname(LOG_FILE), ".tmp_sound.wav")
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_bytes)
+        subprocess.Popen(
+            ['paplay', wav_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        stream.write(pcm)
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
         return True
-    except Exception:
+    except Exception as e:
+        log.warning(f"  Sound: PCM playback failed: {e}")
         return False
 
 
-def _play_audio_file(file_path, volume_boost: float = 1.0, blocking: bool = False):
-    """Spielt eine Audio-Datei ab (ffplay bevorzugt, paplay fallback).
-    
-    Args:
-        file_path: Pfad zur Audio-Datei
-        volume_boost: Volume multiplier (1.0 = normal, 2.0 = doppelt so laut)
-        blocking: If True, wait until playback has finished.
+def _play_audio_file(file_path, blocking: bool = False):
+    """Spielt eine Audio-Datei ab via paplay (PulseAudio/PipeWire).
+
+    paplay routes through PipeWire → correct output device regardless of
+    which sink is active (headset, speakers, HDMI).
     """
     if not file_path or not os.path.isfile(file_path):
         return False
 
-    # ffplay can play MP3/WAV reliably without GUI.
+    # paplay handles WAV/OGA natively; convert MP3 to WAV if needed.
+    play_path = file_path
+    if file_path.lower().endswith('.mp3'):
+        wav_path = file_path.rsplit('.', 1)[0] + '.wav'
+        if not os.path.isfile(wav_path):
+            try:
+                subprocess.run(
+                    ['ffmpeg', '-i', file_path, '-y', wav_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                )
+            except Exception as e:
+                log.warning(f"  Sound: ffmpeg convert failed: {e}")
+                return False
+        play_path = wav_path
+
     try:
-        cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']
-        if volume_boost != 1.0:
-            # Volume filter for volume adjustment
-            cmd.extend(['-af', f'volume={volume_boost}'])
-        cmd.append(file_path)
+        cmd = ['paplay', play_path]
         if blocking:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except FileNotFoundError:
-        pass
-
-    # Fallback (works well for WAV/OGA, no volume boost support).
-    try:
-        if blocking:
-            subprocess.run(
-                ['paplay', file_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-            )
-        else:
-            subprocess.Popen(
-                ['paplay', file_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        return True
-    except FileNotFoundError:
+        log.warning("  Sound: paplay not found")
         return False
 
 
@@ -583,48 +565,41 @@ def _startup_ready_sound(sample_rate=44100):
     return np.concatenate(segments)
 
 
-def play_sound(sound_name, volume_boost: float = 1.0, blocking: bool = False):
-    """Feedback-Sound abspielen.
-    
-    Args:
-        sound_name: Name des Sounds (record_start, record_end)
-        volume_boost: Volume multiplier (for sounds during ducking)
-        blocking: If True, wait until playback has finished.
+def play_sound(sound_name, blocking: bool = False):
+    """Feedback-Sound abspielen via paplay (PipeWire-routed).
+
+    Priority: custom file → synthetic sound → system sound.
     """
     custom_file_map = {
         "record_start": CUSTOM_RECORD_START_SOUND,
         "record_end": CUSTOM_RECORD_END_SOUND,
     }
 
-    # 1) Benutzerdateien haben Vorrang.
-    if _play_audio_file(custom_file_map.get(sound_name), volume_boost=volume_boost, blocking=blocking):
+    # 1) Custom sound files (user-provided).
+    if _play_audio_file(custom_file_map.get(sound_name), blocking=blocking):
         return
 
-    # 2) Synthetic sounds as fallback (no volume boost possible).
-    custom_sounds = {
+    # 2) Synthetic sounds as fallback.
+    synthetic_sounds = {
         "record_start": _switch_click_sound,
         "record_end": _soft_end_buzzer_sound,
         "mic_error": _mic_error_sound,
         "startup_ready": _startup_ready_sound,
     }
 
-    builder = custom_sounds.get(sound_name)
+    builder = synthetic_sounds.get(sound_name)
     if builder is not None and _play_pcm_sound(builder()):
         return
 
-    # Fallback to system sounds (e.g. if output device temporarily blocked).
+    # 3) System sounds (last resort).
     try:
         sound_path = f'/usr/share/sounds/freedesktop/stereo/{sound_name}.oga'
         if blocking:
-            subprocess.run(
-                ['paplay', sound_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-            )
+            subprocess.run(['paplay', sound_path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
-            subprocess.Popen(
-                ['paplay', sound_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.Popen(['paplay', sound_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         pass
 
@@ -662,291 +637,6 @@ def get_rms(data):
     return np.sqrt(np.mean(audio_data.astype(np.float64) ** 2))
 
 
-DUCK_FADE_STEPS = 15        # Number of steps for smooth volume fade
-DUCK_FADE_DURATION = 1.0    # Seconds for fade to 0%
-DUCK_PRE_SOUND_PAUSE = 1.0  # Seconds of silence before start sound
-DUCK_POST_SOUND_PAUSE = 2.0 # Seconds pause after stop sound before music fades back
-SOUND_VOLUME_BOOST = 1.0    # Fixed playback gain for start/stop sounds
-SOUND_SINK_LEVEL = 70       # Fixed sink loudness (%) for start/stop sounds
-
-
-def _parse_sink_inputs_by_pid() -> tuple[list, list]:
-    """Parsed 'pactl list sink-inputs', trennt eigene vs. other Streams.
-
-    Returns: (own_inputs, other_inputs) — je Liste von {index, volume_pct, muted}.
-    """
-    my_pid = str(os.getpid())
-    try:
-        result = subprocess.run(
-            ["pactl", "list", "sink-inputs"],
-            capture_output=True, text=True, timeout=3,
-            env={**os.environ, "LANG": "C", "LC_ALL": "C"}
-        )
-    except Exception:
-        return [], []
-
-    entries, current = [], {}
-    for line in result.stdout.splitlines():
-        s = line.strip()
-        if s.startswith("Sink Input #"):
-            if current.get("index") is not None:
-                entries.append(current)
-            current = {"index": s.split("#")[1], "volume_pct": 100, "muted": False, "pid": ""}
-        elif s.startswith("Mute:"):
-            current["muted"] = "yes" in s.lower()
-        elif s.startswith("Volume:") and "Base Volume" not in s and "index" in current:
-            if "volume_pct" not in current:
-                for token in s.split():
-                    if token.endswith('%'):
-                        try:
-                            current["volume_pct"] = int(token.rstrip('%'))
-                        except ValueError:
-                            pass
-                        break
-        elif "application.process.id" in s and '"' in s:
-            current["pid"] = s.split('"')[1]
-    if current.get("index") is not None:
-        entries.append(current)
-
-    own    = [e for e in entries if e.get("pid") == my_pid]
-    others = [e for e in entries if e.get("pid") != my_pid and not e.get("muted")]
-    return own, others
-
-
-def _get_all_sinks() -> dict:
-    """Returns {sink_id: current_volume_pct} for all active sinks."""
-    sinks = {}
-    try:
-        result = subprocess.run(
-            ["pactl", "list", "sinks", "short"],
-            capture_output=True, text=True, timeout=2
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
-            if not parts:
-                continue
-            sink_id = parts[0]
-            vol_result = subprocess.run(
-                ["pactl", "get-sink-volume", sink_id],
-                capture_output=True, text=True, timeout=2
-            )
-            for token in vol_result.stdout.split():
-                if token.endswith('%'):
-                    try:
-                        sinks[sink_id] = int(token.rstrip('%'))
-                    except ValueError:
-                        pass
-                    break
-    except Exception as e:
-        log.warning(f"  [duck] Sink-Liste failed: {e}")
-    return sinks
-
-
-def _fade_sinks_to(sinks: dict, target_pct: int, duration: float = None):
-    """Fadet alle Sinks auf einen Ziel-Prozentsatz.
-    
-    Args:
-        sinks: {sink_id: current_volume} - used only for IDs
-        target_pct: Target volume in percent (0-100)
-        duration: Fade-Dauer in Sekunden (default: DUCK_FADE_DURATION)
-    """
-    if not sinks:
-        return
-    if duration is None:
-        duration = DUCK_FADE_DURATION
-    
-    try:
-        # Get current volumes for smooth fade
-        current_vols = _get_all_sinks()
-        step_delay = duration / DUCK_FADE_STEPS
-        
-        for step in range(1, DUCK_FADE_STEPS + 1):
-            factor = step / DUCK_FADE_STEPS
-            for sid in sinks:
-                current = current_vols.get(sid, 100)
-                vol = int(current + (target_pct - current) * factor)
-                subprocess.run(["pactl", "set-sink-volume", sid, f"{vol}%"],
-                               capture_output=True, timeout=2)
-            time.sleep(step_delay)
-        
-        # Finale Werte setzen
-        for sid in sinks:
-            subprocess.run(["pactl", "set-sink-volume", sid, f"{target_pct}%"],
-                           capture_output=True, timeout=2)
-        log.debug(f"  [fade] Sinks auf {target_pct}% gefadet ({duration:.1f}s)")
-    except Exception as e:
-        log.warning(f"  [fade] Fade failed: {e}")
-
-
-def _set_sink_volumes(sinks: dict, volumes: dict):
-    """Setzt Sink-Volumes direkt (ohne Fade).
-    
-    Args:
-        sinks: {sink_id: ...} - used only for IDs
-        volumes: {sink_id: volume_pct} - Ziel-Volumes
-    """
-    for sid in sinks:
-        vol = volumes.get(sid, 100)
-        try:
-            subprocess.run(["pactl", "set-sink-volume", sid, f"{vol}%"],
-                           capture_output=True, timeout=2)
-        except Exception as e:
-            log.warning(f"  [set-vol] Error for sink {sid}: {e}")
-
-
-def _get_other_sink_inputs() -> dict:
-    """Gibt {input_index: volume_pct} for all other sink inputs.
-    
-    Filters out our own process (ffplay for sounds).
-    """
-    my_pid = str(os.getpid())
-    inputs = {}
-    
-    try:
-        # LANG=C for English output (independent of system locale)
-        result = subprocess.run(
-            ["pactl", "list", "sink-inputs"],
-            capture_output=True, text=True, timeout=3,
-            env={**os.environ, "LANG": "C", "LC_ALL": "C"}
-        )
-        
-        current = {}
-        for line in result.stdout.splitlines():
-            s = line.strip()
-            if s.startswith("Sink Input #"):
-                if current.get("index") is not None and current.get("pid") != my_pid:
-                    inputs[current["index"]] = current.get("volume_pct", 100)
-                current = {"index": s.split("#")[1], "volume_pct": 100, "pid": ""}
-            elif s.startswith("Volume:") and "Base Volume" not in s:
-                for token in s.split():
-                    if token.endswith('%'):
-                        try:
-                            current["volume_pct"] = int(token.rstrip('%'))
-                        except ValueError:
-                            pass
-                        break
-            elif "application.process.id" in s and '"' in s:
-                current["pid"] = s.split('"')[1]
-        
-        # Letzten Eintrag
-        if current.get("index") is not None and current.get("pid") != my_pid:
-            inputs[current["index"]] = current.get("volume_pct", 100)
-            
-    except Exception as e:
-        log.warning(f"  [duck] Sink-Input-Liste failed: {e}")
-    
-    return inputs
-
-
-def _fade_sink_inputs_to(inputs: dict, target_pct: int, duration: float = None):
-    """Fadet alle sink inputs auf einen Ziel-Prozentsatz.
-    
-    Args:
-        inputs: {input_index: original_volume} 
-        target_pct: Target volume in percent (0-100)
-        duration: Fade-Dauer in Sekunden
-    """
-    if not inputs:
-        return
-    if duration is None:
-        duration = DUCK_FADE_DURATION
-    
-    try:
-        step_delay = duration / DUCK_FADE_STEPS
-        
-        for step in range(1, DUCK_FADE_STEPS + 1):
-            factor = step / DUCK_FADE_STEPS
-            for idx, orig in inputs.items():
-                vol = int(orig + (target_pct - orig) * factor)
-                subprocess.run(["pactl", "set-sink-input-volume", idx, f"{vol}%"],
-                               capture_output=True, timeout=2)
-            time.sleep(step_delay)
-        
-        # Finale Werte setzen
-        for idx in inputs:
-            subprocess.run(["pactl", "set-sink-input-volume", idx, f"{target_pct}%"],
-                           capture_output=True, timeout=2)
-        log.debug(f"  [fade] {len(inputs)} sink inputs auf {target_pct}% gefadet ({duration:.1f}s)")
-    except Exception as e:
-        log.warning(f"  [fade] Sink-Input-Fade failed: {e}")
-
-
-def _restore_sink_inputs(inputs: dict, duration: float = None):
-    """Restores sink inputs to their original volume (with fade)."""
-    if not inputs:
-        return
-    if duration is None:
-        duration = DUCK_FADE_DURATION
-    
-    try:
-        # Aktuelle Volumes holen (LANG=C for English output)
-        current = {}
-        result = subprocess.run(
-            ["pactl", "list", "sink-inputs"],
-            capture_output=True, text=True, timeout=3,
-            env={**os.environ, "LANG": "C", "LC_ALL": "C"}
-        )
-        cur_entry = {}
-        for line in result.stdout.splitlines():
-            s = line.strip()
-            if s.startswith("Sink Input #"):
-                if cur_entry.get("index"):
-                    current[cur_entry["index"]] = cur_entry.get("volume_pct", 0)
-                cur_entry = {"index": s.split("#")[1], "volume_pct": 0}
-            elif s.startswith("Volume:") and "Base Volume" not in s:
-                for token in s.split():
-                    if token.endswith('%'):
-                        try:
-                            cur_entry["volume_pct"] = int(token.rstrip('%'))
-                        except ValueError:
-                            pass
-                        break
-        if cur_entry.get("index"):
-            current[cur_entry["index"]] = cur_entry.get("volume_pct", 0)
-        
-        step_delay = duration / DUCK_FADE_STEPS
-        
-        for step in range(1, DUCK_FADE_STEPS + 1):
-            factor = step / DUCK_FADE_STEPS
-            for idx, orig in inputs.items():
-                cur = current.get(idx, 0)
-                vol = int(cur + (orig - cur) * factor)
-                subprocess.run(["pactl", "set-sink-input-volume", idx, f"{vol}%"],
-                               capture_output=True, timeout=2)
-            time.sleep(step_delay)
-        
-        # Finale Original-Werte setzen
-        for idx, orig in inputs.items():
-            subprocess.run(["pactl", "set-sink-input-volume", idx, f"{orig}%"],
-                           capture_output=True, timeout=2)
-        log.debug(f"  [restore] {len(inputs)} sink inputs restored ({duration:.1f}s)")
-    except Exception as e:
-        log.warning(f"  [restore] Sink-Input-Restore failed: {e}")
-
-
-def _play_chime(sound_name: str) -> None:
-    """Play a chime sound at SOUND_SINK_LEVEL (always fixed), then restore sinks.
-
-    Always temporarily raises all sinks to SOUND_SINK_LEVEL before playback
-    and restores them to their pre-call levels afterward.  Other apps' sink
-    inputs are muted for the duration so the chime is not buried under music.
-    Works regardless of whether DUCK_AUDIO_DURING_RECORDING is active.
-    """
-    sinks = _get_all_sinks()
-    other_inputs = _get_other_sink_inputs()
-    try:
-        if other_inputs:
-            _fade_sink_inputs_to(other_inputs, 0, duration=0.05)
-        if sinks:
-            _set_sink_volumes(sinks, {sid: SOUND_SINK_LEVEL for sid in sinks})
-        play_sound(sound_name)
-        time.sleep(0.5)
-    finally:
-        if sinks:
-            _set_sink_volumes(sinks, sinks)
-        if other_inputs:
-            _restore_sink_inputs(other_inputs, duration=0.05)
-
 
 def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
     """Misst den aktuellen Noise-Floor und leitet einen dynamischen Threshold ab.
@@ -962,7 +652,7 @@ def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
     rms_values = []
     for _ in range(n_chunks):
         try:
-            data = audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            data = _read_chunk(audio_stream, CHUNK_SIZE)
             rms_values.append(get_rms(data))
         except Exception:
             pass
@@ -997,7 +687,7 @@ def record_with_silence_detection(audio_stream, threshold: int = None):
     while total_chunks < max_chunks:
         try:
             # Lese 16kHz chunks (Hardware-Resampling von 48kHz)
-            data = audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            data = _read_chunk(audio_stream, CHUNK_SIZE)
             frames.append(data)
             total_chunks += 1
 
@@ -1058,7 +748,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
             log.info(f"  PTT: 🛑 Key released → Stopp (t={elapsed_ms:.0f}ms)")
             break
         try:
-            data = audio_stream.read(vad_chunk, exception_on_overflow=False)
+            data = _read_chunk(audio_stream, vad_chunk)
         except Exception as e:
             log.warning(f"  VAD read-Error: {e}")
             break
@@ -1068,6 +758,9 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
 
         # Float32 tensor [512] for silero-vad
         audio_f32 = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        if total_chunks % 47 == 1:  # log every ~1.5s
+            rms = float(np.sqrt(np.mean(audio_f32 ** 2)) * 32768)
+            log.debug(f"  VAD[{total_chunks}] RMS={rms:.1f}")
         with torch.no_grad():
             speech_prob = _vad_model(torch.from_numpy(audio_f32), SAMPLE_RATE).item()
 
@@ -1094,13 +787,18 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
     return frames
 
 
+_resolved_device_index: int | None = None  # Actual device used (set by _open_audio_stream)
+
 def _mic_device_info() -> str:
-    """Returns the name of the default input device (for logging)."""
+    """Returns the name of the input device (for logging)."""
     try:
-        info = _pyaudio_instance.get_default_input_device_info()
+        if _resolved_device_index is not None:
+            info = _pyaudio_instance.get_device_info_by_index(_resolved_device_index)
+        else:
+            info = _pyaudio_instance.get_default_input_device_info()
         return f"{info.get('name', '?')} (idx={info.get('index', '?')})"
     except Exception as e:
-        return f"<unbekannt: {e}>"
+        return f"<unknown: {e}>"
 
 
 def _check_mic_ready(max_wait_s: float = 3.0, n_stable_reads: int = 3) -> bool:
@@ -1118,7 +816,7 @@ def _check_mic_ready(max_wait_s: float = 3.0, n_stable_reads: int = 3) -> bool:
     while time.time() < deadline:
         attempts += 1
         try:
-            _audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            _read_chunk(_audio_stream, CHUNK_SIZE)
             consecutive_ok += 1
             log.debug(f"  MIC-CHECK read {attempts}: OK ({consecutive_ok}/{n_stable_reads})")
         except Exception as ex:
@@ -1133,21 +831,51 @@ def _check_mic_ready(max_wait_s: float = 3.0, n_stable_reads: int = 3) -> bool:
     return False
 
 
+def _read_chunk(stream, n_samples: int) -> bytes:
+    """Read n_samples of 16kHz mono int16 from input stream."""
+    return stream.read(n_samples, exception_on_overflow=False)
+
+
+def _find_pulse_device_index(pa: pyaudio.PyAudio) -> int | None:
+    """Find the 'pulse' PyAudio device index for PipeWire/PulseAudio routing."""
+    for i in range(pa.get_device_count()):
+        try:
+            info = pa.get_device_info_by_index(i)
+            if info.get("name") == "pulse" and info.get("maxInputChannels", 0) > 0:
+                return i
+        except Exception:
+            continue
+    return None
+
+
 def _open_audio_stream():
-    """(Re)opens input stream when needed."""
-    global _pyaudio_instance, _audio_stream
+    """(Re)opens 16kHz mono input stream via PipeWire/PulseAudio."""
+    global _pyaudio_instance, _audio_stream, _resolved_device_index
 
     if _pyaudio_instance is None:
         _pyaudio_instance = pyaudio.PyAudio()
 
     if _audio_stream is None:
-        _audio_stream = _pyaudio_instance.open(
+        device_idx = INPUT_DEVICE_INDEX
+        # When no specific device is configured, prefer the 'pulse' device
+        # which properly routes through PipeWire (ALSA 'default' often returns zeros).
+        if device_idx is None:
+            pulse_idx = _find_pulse_device_index(_pyaudio_instance)
+            if pulse_idx is not None:
+                device_idx = pulse_idx
+                log.info(f"  Auto-selected 'pulse' device (idx={pulse_idx}) for PipeWire routing")
+        _resolved_device_index = device_idx
+
+        kwargs = dict(
             format=pyaudio.paInt16,
             channels=1,
             rate=SAMPLE_RATE,
             input=True,
             frames_per_buffer=CHUNK_SIZE,
         )
+        if device_idx is not None:
+            kwargs["input_device_index"] = device_idx
+        _audio_stream = _pyaudio_instance.open(**kwargs)
         log.info(f"  ✅ Input stream opened | Device: {_mic_device_info()}")
 
 
@@ -1456,9 +1184,7 @@ def _control_server_loop():
 
 
 def _start_control_server():
-    global _control_server_thread
-    _control_server_thread = threading.Thread(target=_control_server_loop, daemon=True)
-    _control_server_thread.start()
+    threading.Thread(target=_control_server_loop, daemon=True).start()
 
 
 def _watch_loop():
@@ -1570,7 +1296,7 @@ def _watch_loop():
                 _audio_stream = None
                 _open_audio_stream()
 
-            data = _audio_stream.read(VAD_CHUNK_SAMPLES, exception_on_overflow=False)
+            data = _read_chunk(_audio_stream, VAD_CHUNK_SAMPLES)
             chunk_i16 = np.frombuffer(data, dtype=np.int16)
             chunk_rms = get_rms(chunk_i16.tobytes())
             is_speech = chunk_rms > WATCH_RMS_THRESHOLD
@@ -1662,9 +1388,7 @@ def _watch_loop():
 
 
 def _start_watch_thread():
-    global _watch_thread
-    _watch_thread = threading.Thread(target=_watch_loop, daemon=True)
-    _watch_thread.start()
+    threading.Thread(target=_watch_loop, daemon=True).start()
 
 
 def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
@@ -1741,70 +1465,56 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         try:
             _audio_stream.stop_stream()
             _audio_stream.close()
-            _audio_stream = _pyaudio_instance.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-            )
+            _audio_stream = None
+            _open_audio_stream()
             log.info("  [2] Stream neu opened — second Readiness-Check...")
             mic_ready = _check_mic_ready(max_wait_s=2.0)
             log.info(f"  [2] Zweiter check: mic_ready={mic_ready}")
         except Exception as e:
             log.error(f"  [2] ❌ Stream-Neustart failed: {e}")
             notify("❌ Mic not ready", f"Mic error: {e}", "critical")
-            _play_chime("mic_error")
+            play_sound("mic_error")
             return
 
     if not mic_ready:
         log.error("  [2] ❌ Mic not ready after retry — aborting")
         notify("❌ Mic not ready", "Microphone not available", "critical")
-        _play_chime("mic_error")
+        play_sound("mic_error")
         return
 
     # Signal that recording pipeline is armed and mic is ready.
-    # This is only reached when start_stream() + N consecutive reads all succeeded.
     _recording_ready_event.set()
 
-    # ── 2b. Sink-Volumes erfassen (kein per-app Ducking) ─────────
-    _original_sinks = {}
-    if DUCK_AUDIO_DURING_RECORDING:
-        _original_sinks = _get_all_sinks()
-        log.info(f"  [2b] 📊 Sinks captured: {len(_original_sinks)}")
-
-    # ── 2c. Sink-Volumes absenken (sanfter Übergang) ─────────────
-    # Skip in PTT mode (too slow, sound already played)
+    # ── 2b. Start-Sound ───────────────────────────────────────────
     if not skip_start_sound:
-        if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-            log.info(f"  [2c] 🔉 Fade: Sinks → {DUCK_SINK_LEVEL}% ({DUCK_FADE_DURATION}s)")
-            _fade_sinks_to(_original_sinks, DUCK_SINK_LEVEL)
-            # Silence vor dem Start-Sound
-            log.info(f"  [2c] 🤫 Silence pause ({DUCK_PRE_SOUND_PAUSE}s)")
-            time.sleep(DUCK_PRE_SOUND_PAUSE)
-
-        # ── 2d. Start-Sound
-        log.info(f"  [2d] 🔔 Start-Sound @ {SOUND_SINK_LEVEL}%")
-        _play_chime("record_start")
+        play_sound("record_start")
         notify("🔴 Recording", "Speak now...")
     else:
-        log.info("  [2d] ⏭️  Start-Sound skipped (PTT mode)")
         notify("🔴 PTT Recording", "Speak...")
 
-    # ── 2e. Kalibrierung (nur RMS-Fallback) ──────────────────────
+    # ── 2c. Drain stale buffer after start sound ──────────────────
+    # Read and discard ~0.5s of buffered audio to get fresh data.
+    drain_count = max(1, int(0.5 * SAMPLE_RATE / CHUNK_SIZE))
+    for _ in range(drain_count):
+        try:
+            _audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+        except Exception:
+            break
+
+    # ── 2d. Kalibrierung (nur RMS-Fallback) ──────────────────────
     use_vad = VAD_ENABLED and _vad_model is not None
     if not use_vad:
         dynamic_threshold = calibrate_silence_threshold(_audio_stream)
-        log.info(f"  [2e] RMS-Fallback: threshold={dynamic_threshold}")
+        log.info(f"  [2d] RMS-Fallback: threshold={dynamic_threshold}")
     else:
         dynamic_threshold = None
 
     if use_vad:
         log.info(f"  [3] 🔴 Recording (VAD, threshold={VAD_THRESHOLD}, "
-                 f"min_silence={VAD_MIN_SILENCE_MS}ms, sink_level={DUCK_SINK_LEVEL}%)")
+                 f"min_silence={VAD_MIN_SILENCE_MS}ms)")
     else:
         log.info(f"  [3] 🔴 Recording (RMS, Silence-Limit={SILENCE_DURATION}s, "
-                 f"Threshold={dynamic_threshold}, sink_level={DUCK_SINK_LEVEL}%)")
+                 f"Threshold={dynamic_threshold})")
 
     # ── 4. Recording ─────────────────────────────────────────────
     record_start_ts = time.time()
@@ -1827,22 +1537,10 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         finally:
             _recording_stopped_event.set()
 
-    # ── 5. Stop-Sound (Music ist noch geduckt) ─────────────────────
-    # In PTT mode, stop sound was already played on key release
+    # ── 5. Stop-Sound ───────────────────────────────────────────────
     if not ptt_mode:
-        log.info(f"  [5] 🔔 Stop-Sound @ {SOUND_SINK_LEVEL}%")
-        _play_chime("record_end")
-    else:
-        log.info("  [5] ⏭️  Stop-Sound skipped (PTT mode, already played)")
-
-    # ── 5b. Pause after stop sound, dann Sinks auf Originalwerte ───
-    if DUCK_AUDIO_DURING_RECORDING and _original_sinks:
-        log.info(f"  [5b] ⏸️  Pause after stop sound ({DUCK_POST_SOUND_PAUSE}s)")
-        time.sleep(DUCK_POST_SOUND_PAUSE)
-        log.info(f"  [5c] 🔊 Restoring sink volumes ({DUCK_FADE_DURATION}s)")
-        _set_sink_volumes(_original_sinks, _original_sinks)
-    else:
-        time.sleep(0.3)
+        play_sound("record_end")
+    time.sleep(0.3)
 
     if not frames:
         log.warning("  [5] No audio frames recorded")
@@ -2007,7 +1705,7 @@ def listen_keyboard_hotkey(hotkey):
                             ready = _recording_ready_event.wait(timeout=1.5)
                             if not ready:
                                 log.warning("  [ptt] ready-event timeout; playing start chime fallback")
-                            _play_chime("record_start")
+                            play_sound("record_start")
                         threading.Thread(target=_late_ptt_chime, daemon=True).start()
                 
                 threading.Thread(target=check_ptt, daemon=True).start()
@@ -2036,7 +1734,7 @@ def listen_keyboard_hotkey(hotkey):
                     stopped = _recording_stopped_event.wait(timeout=2.5)
                     if not stopped:
                         log.warning("  [ptt] stop-event timeout; playing stop chime fallback")
-                    _play_chime("record_end")
+                    play_sound("record_end")
 
                 threading.Thread(target=_ptt_stop_chime_on_event, daemon=True).start()
             elif press_duration < ptt_state['ptt_threshold'] and not _recording_lock.locked():
@@ -2079,7 +1777,7 @@ def main():
     global MODEL_SIZE, LANGUAGE, ENGINE, BEAM_SIZE, INITIAL_PROMPT
     global SILENCE_DURATION, SILENCE_THRESHOLD
     global VAD_ENABLED, VAD_THRESHOLD, VAD_MIN_SILENCE_MS
-    global DUCK_AUDIO_DURING_RECORDING, DUCK_SINK_LEVEL
+    global INPUT_DEVICE_INDEX
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
@@ -2090,19 +1788,20 @@ def main():
     cfg = load_config()
     rec = cfg.get("recording", {})
     vad = cfg.get("vad", {})
-    duck = cfg.get("duck", {})
     sounds = cfg.get("sounds", {})
     api_cfg = cfg.get("api", {})
     watch_cfg = cfg.get("watch", {})
     trans_cfg = cfg.get("transcription", {})
     actions_cfg = cfg.get("actions", {})
 
+    # Input device override from [recording] section
+    if rec.get("device") is not None:
+        INPUT_DEVICE_INDEX = int(rec["device"])
+
     # Config values as defaults (CLI overrides these)
     if vad.get("enabled") is not None:    VAD_ENABLED        = vad["enabled"]
     if vad.get("threshold"):              VAD_THRESHOLD      = float(vad["threshold"])
     if vad.get("min_silence_ms"):         VAD_MIN_SILENCE_MS = int(vad["min_silence_ms"])
-    if duck.get("enabled") is not None:   DUCK_AUDIO_DURING_RECORDING = duck["enabled"]
-    if duck.get("sink_level") is not None: DUCK_SINK_LEVEL   = int(duck["sink_level"])
     if sounds.get("start"):               CUSTOM_RECORD_START_SOUND = sounds["start"]
     if sounds.get("stop"):                CUSTOM_RECORD_END_SOUND   = sounds["stop"]
     if api_cfg.get("base_url"):           WHISPER_API_BASE_URL = api_cfg["base_url"]
@@ -2400,7 +2099,7 @@ Config File: ~/.config/voice-type/config.toml
     print()
 
     # Signal readiness — plays after model load + warmup, right before hotkey loop.
-    _play_chime("startup_ready")
+    play_sound("startup_ready")
     log.info("  ✅ Startup complete — watch mode ready")
 
     # Start watch thread here, after full init (model loaded, stream opened).
