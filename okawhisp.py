@@ -116,7 +116,8 @@ INITIAL_PROMPT = None       # Context prompt for technical terms
 SILENCE_THRESHOLD = 200     # RMS threshold for silence (Jabra BT: speech ~220 RMS)
 SILENCE_DURATION = 2.0      # Seconds of silence until auto-stop (RMS fallback)
 MIN_RECORD_SECONDS = 1.0    # Minimum recording duration
-MAX_RECORD_SECONDS = 120    # Maximum recording duration
+MAX_RECORD_SECONDS = 120    # No-speech timeout (recording stops if no speech within this)
+MAX_RECORD_SECONDS_ABSOLUTE = 360  # Hard limit — even with active speech (6 min)
 
 # ── silero-vad (Voice Activity Detection) ───────────────────────
 # Replaces RMS threshold with ML-based speech recognition.
@@ -746,6 +747,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
     min_speech_chunks     = int(VAD_MIN_SPEECH_MS  / ms_per_chunk)
     min_total_chunks      = int(MIN_RECORD_SECONDS * 1000 / ms_per_chunk)
     max_total_chunks      = int(MAX_RECORD_SECONDS * 1000 / ms_per_chunk)
+    absolute_max_chunks   = int(MAX_RECORD_SECONDS_ABSOLUTE * 1000 / ms_per_chunk)
 
     frames          = []
     speech_chunks   = 0   # consecutive speech chunks
@@ -753,7 +755,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
     speech_started  = False
     total_chunks    = 0
 
-    while total_chunks < max_total_chunks:
+    while total_chunks < max_total_chunks and total_chunks < absolute_max_chunks:
         # PTT mode: stop immediately when key released
         if ptt_mode and _ptt_stop_requested:
             elapsed_ms = total_chunks * ms_per_chunk
@@ -781,6 +783,10 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
         if is_speech:
             speech_chunks += 1
             silence_streak = 0
+            # Extend timeout while speech is active
+            new_max = total_chunks + int(MAX_RECORD_SECONDS * 1000 / ms_per_chunk)
+            if new_max > max_total_chunks:
+                max_total_chunks = min(new_max, absolute_max_chunks)
             if not speech_started and speech_chunks >= min_speech_chunks:
                 speech_started = True
                 elapsed_ms = total_chunks * ms_per_chunk
