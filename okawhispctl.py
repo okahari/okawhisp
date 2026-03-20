@@ -10,6 +10,7 @@ from pathlib import Path
 
 SOCKET_PATH = str(Path.home() / ".local" / "share" / "okawhisp" / "control.sock")
 SERVICE_PATH = Path.home() / ".config" / "systemd" / "user" / "okawhisp.service"
+CONFIG_PATH = Path.home() / ".config" / "okawhisp" / "config.toml"
 
 
 def send(req: dict):
@@ -25,26 +26,52 @@ def send(req: dict):
         s.close()
 
 
-def _read_execstart_args():
-    if not SERVICE_PATH.exists():
-        return []
-    txt = SERVICE_PATH.read_text()
-    m = re.search(r"^ExecStart=(.+)$", txt, flags=re.MULTILINE)
-    if not m:
-        return []
-    return m.group(1).strip().split()
+def _read_config():
+    """Read config.toml and return as dict (requires tomllib or toml)."""
+    if not CONFIG_PATH.exists():
+        return {}
+    txt = CONFIG_PATH.read_text()
+    try:
+        import tomllib
+        return tomllib.loads(txt)
+    except ImportError:
+        pass
+    try:
+        import tomli
+        return tomli.loads(txt)
+    except ImportError:
+        pass
+    # Minimal fallback: parse key = "value" lines
+    cfg = {}
+    for line in txt.splitlines():
+        m = re.match(r'^\s*(\w+)\s*=\s*"([^"]*)"', line)
+        if m:
+            cfg[m.group(1)] = m.group(2)
+    return cfg
+
+
+def _write_config_value(section: str, key: str, value: str):
+    """Update a single key in config.toml, preserving structure."""
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(f"[{section}]\n{key} = \"{value}\"\n")
+        return
+    txt = CONFIG_PATH.read_text()
+    pattern = rf'^(\s*{re.escape(key)}\s*=\s*)"[^"]*"'
+    new_txt, count = re.subn(pattern, rf'\1"{value}"', txt, flags=re.MULTILINE)
+    if count == 0:
+        # Key not found — append to section or create section
+        if f"[{section}]" in txt:
+            new_txt = txt.replace(f"[{section}]", f"[{section}]\n{key} = \"{value}\"")
+        else:
+            new_txt = txt.rstrip() + f"\n\n[{section}]\n{key} = \"{value}\"\n"
+    CONFIG_PATH.write_text(new_txt)
 
 
 def _current_engine_model():
-    args = _read_execstart_args()
-    engine = None
-    model = None
-    for i, a in enumerate(args):
-        if a == "--engine" and i + 1 < len(args):
-            engine = args[i + 1]
-        if a == "--model" and i + 1 < len(args):
-            model = args[i + 1]
-    return engine, model
+    cfg = _read_config()
+    rec = cfg.get("recording", cfg)  # flat fallback
+    return rec.get("engine"), rec.get("model")
 
 
 def _cache_present(engine: str, model: str):
@@ -128,15 +155,9 @@ def model_pull(engine: str, model: str):
 
 
 def model_set(engine: str, model: str):
-    if not SERVICE_PATH.exists():
-        return {"ok": False, "message": f"service file not found: {SERVICE_PATH}"}
+    _write_config_value("recording", "engine", engine)
+    _write_config_value("recording", "model", model)
 
-    txt = SERVICE_PATH.read_text()
-    txt = re.sub(r"--engine\s+\S+", f"--engine {engine}", txt)
-    txt = re.sub(r"--model\s+\S+", f"--model {model}", txt)
-    SERVICE_PATH.write_text(txt)
-
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "reset-failed", "okawhisp.service"], check=False)
     restart = subprocess.run(["systemctl", "--user", "restart", "okawhisp.service"], check=False)
 
@@ -144,12 +165,12 @@ def model_set(engine: str, model: str):
         "ok": restart.returncode == 0,
         "engine": engine,
         "model": model,
-        "message": "service restarted" if restart.returncode == 0 else "restart failed",
+        "message": "config updated, service restarted" if restart.returncode == 0 else "config updated, restart failed",
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="okawhispctl")
+    parser = argparse.ArgumentParser(prog="okawhisp")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status")

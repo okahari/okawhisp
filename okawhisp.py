@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Requirements: pyaudio, numpy, faster-whisper, silero-vad>=6.0, torch, pynput
-# Install via: python3 -m pip install --user pyaudio numpy faster-whisper silero-vad torch pynput
+# Requirements: numpy, faster-whisper, silero-vad>=6.0, torch, pynput
+# System: parec (pulseaudio-utils) for audio capture
+# Install via: python3 -m pip install --user numpy faster-whisper silero-vad torch pynput
 """
 OkaWhisp - System-Level Voice-to-Text for Any Window
 =====================================================
@@ -39,10 +40,10 @@ import argparse
 import warnings
 import os
 
-try:
-    import pyaudio
-except ImportError:
-    print("❌ PyAudio not installed. Run: sudo apt install portaudio19-dev && pip install --user pyaudio")
+import shutil
+
+if not shutil.which("parec"):
+    print("❌ parec not found. Run: sudo apt install pulseaudio-utils")
     sys.exit(1)
 try:
     import numpy as np
@@ -56,6 +57,7 @@ import json
 import socket
 import re
 import queue as _queue_mod
+import select
 from pathlib import Path
 from datetime import datetime
 try:
@@ -102,8 +104,9 @@ SAMPLE_RATE = 16000         # Whisper requires 16kHz
 CHUNK_SIZE = 1024           # ~64ms per chunk (at 16kHz)
 
 # Input device override (read from config.toml [recording] section).
-# None = auto-detect best PipeWire/PulseAudio device.
-INPUT_DEVICE_INDEX = None
+# None = PulseAudio/PipeWire default source. Can be a PulseAudio source name
+# (e.g. "bluez_input.XX:XX:XX:XX:XX:XX" for a specific Bluetooth mic).
+INPUT_DEVICE = None
 
 MODEL_SIZE = "medium"       # medium = best balance for RTX 3060 Ti
 LANGUAGE = "de"             # German as default (None = auto-detect)
@@ -195,10 +198,10 @@ _vad_model = None           # silero-vad model (loaded at startup)
 _recording_lock = threading.Lock()
 _ptt_stop_requested = False  # PTT mode: stop when key released
 
-# Persistent PyAudio instance; stream is opened/closed on demand.
+# Persistent parec subprocess; opened/closed on demand.
 # Starts "warm" and closes after idle timeout (privacy + GNOME mic indicator).
-_pyaudio_instance = None
-_audio_stream = None
+_audio_proc = None       # subprocess.Popen running parec
+_audio_stream = None     # alias for _audio_proc (record functions use this)
 
 # Idle close policy (requested): 60s after app start and 60s after each recording stop.
 IDLE_CLOSE_SECONDS = 60
@@ -781,7 +784,7 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
             if not speech_started and speech_chunks >= min_speech_chunks:
                 speech_started = True
                 elapsed_ms = total_chunks * ms_per_chunk
-                log.debug(f"  VAD: 🗣  Speech detected (prob={speech_prob:.2f}, t={elapsed_ms:.0f}ms)")
+                log.info(f"  VAD: 🗣  Speech detected (prob={speech_prob:.2f}, t={elapsed_ms:.0f}ms)")
         else:
             speech_chunks = 0
             if speech_started:
@@ -789,123 +792,137 @@ def record_with_vad(audio_stream, ptt_mode: bool = False) -> list:
                 if (total_chunks >= min_total_chunks and
                         silence_streak >= silence_chunks_needed):
                     elapsed_ms = total_chunks * ms_per_chunk
-                    log.debug(f"  VAD: 🤫 Silence {silence_streak * ms_per_chunk:.0f}ms → stop "
-                              f"(t={elapsed_ms:.0f}ms)")
+                    log.info(f"  VAD: 🤫 Silence {silence_streak * ms_per_chunk:.0f}ms → stop "
+                             f"(t={elapsed_ms:.0f}ms)")
                     break
+
+        # Log progress every ~3s
+        if total_chunks % 94 == 1:
+            elapsed_ms = total_chunks * ms_per_chunk
+            rms = float(np.sqrt(np.mean(audio_f32 ** 2)) * 32768)
+            log.info(f"  VAD[{elapsed_ms/1000:.0f}s] prob={speech_prob:.3f} rms={rms:.0f} "
+                     f"speech_started={speech_started}")
+
+    # If we ran the full duration without speech, return empty
+    if not speech_started:
+        elapsed_s = total_chunks * ms_per_chunk / 1000
+        log.warning(f"  VAD: ⚠ No speech detected in {elapsed_s:.0f}s → discarding")
+        return []
 
     return frames
 
 
-_resolved_device_index: int | None = None  # Actual device used (set by _open_audio_stream)
-
 def _mic_device_info() -> str:
-    """Returns the name of the input device (for logging)."""
-    try:
-        if _resolved_device_index is not None:
-            info = _pyaudio_instance.get_device_info_by_index(_resolved_device_index)
-        else:
-            info = _pyaudio_instance.get_default_input_device_info()
-        return f"{info.get('name', '?')} (idx={info.get('index', '?')})"
-    except Exception as e:
-        return f"<unknown: {e}>"
+    """Returns recording device info (for logging)."""
+    if INPUT_DEVICE:
+        return f"parec (device={INPUT_DEVICE})"
+    return "parec (system default mic)"
 
 
-def _check_mic_ready(max_wait_s: float = 3.0, n_stable_reads: int = 3) -> bool:
-    """Checks mic readiness: N consecutive successful stream.read() calls without exception.
+def _check_mic_ready(max_wait_s: float = 5.0, n_stable_reads: int = 3) -> bool:
+    """Checks mic readiness: N consecutive successful reads with non-zero audio.
 
-    Ready = start_stream() already succeeded + N reads without error.
-    No RMS heuristics — pure stream I/O stability check.
+    Bluetooth mics often connect but deliver only zero-frames for several
+    seconds while the HFP audio transport is still being established.
+    We require at least one read with RMS > 0 to confirm real data flow.
 
     Returns True if ready, False on timeout.
     """
     deadline = time.time() + max_wait_s
     consecutive_ok = 0
+    seen_nonzero = False
     attempts = 0
 
     while time.time() < deadline:
         attempts += 1
         try:
-            _read_chunk(_audio_stream, CHUNK_SIZE)
-            consecutive_ok += 1
-            log.debug(f"  MIC-CHECK read {attempts}: OK ({consecutive_ok}/{n_stable_reads})")
+            data = _read_chunk(_audio_stream, CHUNK_SIZE)
+            if data and len(data) == CHUNK_SIZE * 2:
+                consecutive_ok += 1
+                samples = np.frombuffer(data, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                if rms > 0:
+                    seen_nonzero = True
+            else:
+                consecutive_ok = 0
+            log.debug(f"  MIC-CHECK read {attempts}: OK ({consecutive_ok}/{n_stable_reads}) nonzero={seen_nonzero}")
         except Exception as ex:
             consecutive_ok = 0
             log.warning(f"  MIC-CHECK read {attempts}: FAILED ({ex})")
 
-        if consecutive_ok >= n_stable_reads:
-            log.info(f"  ✅ Microphone ready after {attempts} read(s) ({n_stable_reads} consecutive OK)")
+        if consecutive_ok >= n_stable_reads and seen_nonzero:
+            log.info(f"  ✅ Microphone ready after {attempts} read(s) ({n_stable_reads} consecutive OK, non-zero audio)")
             return True
 
-    log.warning(f"  ⚠️  Microphone NOT ready after {max_wait_s:.1f}s ({attempts} attempts)")
+    log.warning(f"  ⚠️  Microphone NOT ready after {max_wait_s:.1f}s ({attempts} attempts, nonzero={seen_nonzero})")
     return False
 
 
-def _read_chunk(stream, n_samples: int) -> bytes:
-    """Read n_samples of 16kHz mono int16 from input stream."""
-    return stream.read(n_samples, exception_on_overflow=False)
+def _read_chunk(stream, n_samples: int, timeout: float = 5.0) -> bytes:
+    """Read n_samples of 16kHz mono int16 from parec stdout.
 
-
-def _find_pulse_device_index(pa: pyaudio.PyAudio) -> int | None:
-    """Find the 'pulse' PyAudio device index for PipeWire/PulseAudio routing."""
-    for i in range(pa.get_device_count()):
-        try:
-            info = pa.get_device_info_by_index(i)
-            if info.get("name") == "pulse" and info.get("maxInputChannels", 0) > 0:
-                return i
-        except Exception:
+    Uses select() to avoid blocking forever when the audio device stops
+    delivering data (e.g. Bluetooth mic disconnects while parec is running).
+    """
+    n_bytes = n_samples * 2  # int16 = 2 bytes per sample
+    fd = stream.stdout.fileno()
+    buf = b""
+    deadline = time.time() + timeout
+    while len(buf) < n_bytes:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise IOError(f"Audio read timeout ({timeout}s) — mic not delivering data")
+        ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+        if not ready:
             continue
-    return None
+        chunk = os.read(fd, n_bytes - len(buf))
+        if not chunk:
+            raise IOError("Audio stream ended (parec terminated)")
+        buf += chunk
+    return buf
 
 
 def _open_audio_stream():
-    """(Re)opens 16kHz mono input stream via PipeWire/PulseAudio."""
-    global _pyaudio_instance, _audio_stream, _resolved_device_index
+    """Opens 16kHz mono input stream via parec (PulseAudio/PipeWire native)."""
+    global _audio_proc, _audio_stream
 
-    if _pyaudio_instance is None:
-        _pyaudio_instance = pyaudio.PyAudio()
+    if _audio_proc is not None and _audio_proc.poll() is None:
+        return  # already running
 
-    if _audio_stream is None:
-        device_idx = INPUT_DEVICE_INDEX
-        # When no specific device is configured, prefer the 'pulse' device
-        # which properly routes through PipeWire (ALSA 'default' often returns zeros).
-        if device_idx is None:
-            pulse_idx = _find_pulse_device_index(_pyaudio_instance)
-            if pulse_idx is not None:
-                device_idx = pulse_idx
-                log.info(f"  Auto-selected 'pulse' device (idx={pulse_idx}) for PipeWire routing")
-        _resolved_device_index = device_idx
+    cmd = [
+        "parec",
+        "--rate", str(SAMPLE_RATE),
+        "--channels", "1",
+        "--format", "s16le",
+        "--latency-msec", "30",
+    ]
+    if INPUT_DEVICE:
+        cmd += ["--device", INPUT_DEVICE]
 
-        kwargs = dict(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        if device_idx is not None:
-            kwargs["input_device_index"] = device_idx
-        _audio_stream = _pyaudio_instance.open(**kwargs)
-        log.info(f"  ✅ Input stream opened | Device: {_mic_device_info()}")
+    log.info(f"  Starting audio: {' '.join(cmd)}")
+    _audio_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _audio_stream = _audio_proc
+    log.info(f"  ✅ Input stream opened | {_mic_device_info()}")
 
 
 def _close_audio_stream(reason: str = "idle-timeout"):
-    """Closes input stream fully (removes active mic handle in PipeWire)."""
-    global _audio_stream
+    """Terminates the parec subprocess."""
+    global _audio_proc, _audio_stream
 
-    if _audio_stream is None:
+    if _audio_proc is None:
         return
 
     try:
-        if _audio_stream.is_active():
-            _audio_stream.stop_stream()
-    except Exception:
-        pass
-
-    try:
-        _audio_stream.close()
+        _audio_proc.terminate()
+        _audio_proc.wait(timeout=2)
     except Exception as ex:
         log.warning(f"  ⚠️  close_stream failed ({reason}): {ex}")
+        try:
+            _audio_proc.kill()
+        except Exception:
+            pass
     finally:
+        _audio_proc = None
         _audio_stream = None
         log.info(f"  💤 Input stream closed ({reason})")
 
@@ -1317,25 +1334,15 @@ def _watch_loop():
         # Ensure stream is open and active
         try:
             _cancel_idle_close_timer()
+            if _audio_proc is not None and _audio_proc.poll() is not None:
+                _close_audio_stream("watch-proc-dead")
             _open_audio_stream()
-            if _audio_stream.is_stopped():
-                try:
-                    _audio_stream.close()
-                except Exception:
-                    pass
-                _audio_stream = None
-                _open_audio_stream()
 
             data = _read_chunk(_audio_stream, vad_chunk)
         except Exception as ex:
             msg = str(ex)
-            if "-9988" in msg or "Stream closed" in msg or "-9983" in msg:
-                try:
-                    if _audio_stream is not None:
-                        _audio_stream.close()
-                except Exception:
-                    pass
-                _audio_stream = None
+            if "stream ended" in msg.lower() or "terminated" in msg.lower():
+                _close_audio_stream("watch-stream-error")
                 log.warning("  [watch] stream error -> recovering")
                 time.sleep(0.35)
                 continue
@@ -1452,23 +1459,19 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     ptt_mode: If True, PTT mode - stop on key release, send with Enter at end.
     skip_start_sound: If True, start sound was already played externally.
     """
-    global _audio_stream
+    global _audio_proc, _audio_stream
 
     _cancel_idle_close_timer()
+    # Fresh parec process for recording (avoids pipe race with watch loop)
+    _close_audio_stream("recording-start")
     _open_audio_stream()
 
-    # ── 1. Check stream status & start ─────────────────────────────
-    stream_active = _audio_stream.is_active() if _audio_stream else False
-    stream_stopped = _audio_stream.is_stopped() if _audio_stream else True
-    log.info(f"  [1] Stream status before start: active={stream_active}, stopped={stream_stopped}")
+    # ── 1. Check stream status ─────────────────────────────────────
     log.info(f"  [1] Input device: {_mic_device_info()}")
 
-    try:
-        _audio_stream.start_stream()
-        log.info(f"  [1] start_stream() OK → active={_audio_stream.is_active()}")
-    except Exception as e:
-        log.error(f"  [1] ❌ start_stream() failed: {e}")
-        notify("❌ Audio error", str(e), "critical")
+    if _audio_proc is None or _audio_proc.poll() is not None:
+        log.error("  [1] ❌ parec failed to start")
+        notify("❌ Audio error", "parec not running", "critical")
         return
 
     # ── 2. Device readiness check (wait for Bluetooth reconnect) ───
@@ -1479,9 +1482,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     if not mic_ready:
         log.warning("  [2] Mic not ready — attempting stream reopen...")
         try:
-            _audio_stream.stop_stream()
-            _audio_stream.close()
-            _audio_stream = None
+            _close_audio_stream("mic-not-ready")
             _open_audio_stream()
             log.info("  [2] Stream reopened — second readiness check...")
             mic_ready = _check_mic_ready(max_wait_s=2.0)
@@ -1513,7 +1514,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     drain_count = max(1, int(0.5 * SAMPLE_RATE / CHUNK_SIZE))
     for _ in range(drain_count):
         try:
-            _audio_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            _read_chunk(_audio_stream, CHUNK_SIZE)
         except Exception:
             break
 
@@ -1545,13 +1546,9 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         frames = []
     finally:
         elapsed_record = time.time() - record_start_ts
-        try:
-            _audio_stream.stop_stream()
-            log.info(f"  [4] ⏹  Stream stopped after {elapsed_record:.2f}s | active={_audio_stream.is_active()}")
-        except Exception as ex:
-            log.warning(f"  [4] stop_stream() Error: {ex}")
-        finally:
-            _recording_stopped_event.set()
+        _close_audio_stream("recording-end")
+        log.info(f"  [4] ⏹  Stream closed after {elapsed_record:.2f}s")
+        _recording_stopped_event.set()
 
     # ── 5. Stop-Sound ───────────────────────────────────────────────
     if not ptt_mode:
@@ -1568,7 +1565,7 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
     duration = len(audio_np) / SAMPLE_RATE
     rms_overall = float(np.sqrt(np.mean(audio_np ** 2))) * 32768
-    log.info(f"  [6] Audio: {duration:.2f}s, {len(frames)} chunks, RMS_total={rms_overall:.1f}")
+    log.info(f"  [6] Audio: {duration:.2f}s, {len(frames)} chunks, RMS={rms_overall:.1f}")
 
     if duration < 0.5:
         log.warning("  [6] Recording too short (<0.5s) — discarded")
@@ -1793,7 +1790,7 @@ def main():
     global MODEL_SIZE, LANGUAGE, ENGINE, BEAM_SIZE, INITIAL_PROMPT
     global SILENCE_DURATION, SILENCE_THRESHOLD
     global VAD_ENABLED, VAD_THRESHOLD, VAD_MIN_SILENCE_MS
-    global INPUT_DEVICE_INDEX
+    global INPUT_DEVICE
     global CUSTOM_RECORD_START_SOUND, CUSTOM_RECORD_END_SOUND
     global WHISPER_API_BASE_URL, WHISPER_API_KEY, WHISPER_API_MODEL
     global IDLE_CLOSE_SECONDS, ACTION_TRIGGERS, ACTION_COOLDOWN_MS, AUTO_PROMPT_FROM_TRIGGERS, WATCH_ACTIVE
@@ -1809,11 +1806,10 @@ def main():
     actions_cfg = cfg.get("actions", {})
 
     # Input device override from [recording] section
+    # Value is a PulseAudio source name (e.g. "bluez_input.XX:XX:XX:XX:XX:XX")
     if rec.get("device") is not None:
-        try:
-            INPUT_DEVICE_INDEX = int(rec["device"])
-        except (ValueError, TypeError):
-            log.warning(f"  Config: invalid device value '{rec['device']}', using auto-detect")
+        INPUT_DEVICE = str(rec["device"])
+        log.info(f"  Config: device override = {INPUT_DEVICE}")
 
     # Config values as defaults (CLI overrides these)
     if vad.get("enabled") is not None:    VAD_ENABLED        = vad["enabled"]
@@ -1939,8 +1935,7 @@ Config file: ~/.config/okawhisp/config.toml
 
     # Control socket (okawhispctl) — starts early, no audio interaction.
     # Watch thread is started after full init (model load + warmup + stream open)
-    # to avoid a race where it opens the stream before the warm-start stop_stream()
-    # and then tries start_stream() on a BT HFP stream that PipeWire won't re-activate.
+    # to avoid a race where it opens the stream before full init completes.
     _start_control_server()
 
     # ── Pre-flight checks (before slow model loading) ─────────
@@ -2076,14 +2071,12 @@ Config file: ~/.config/okawhisp/config.toml
     print("─" * 60)
     print()
 
-    # PyAudio instance + stream warm start; close again after 60s idle.
-    global _pyaudio_instance, _audio_stream
+    # parec warm start; close again after idle timeout.
     try:
         _open_audio_stream()
-        _audio_stream.stop_stream()  # warm start, no active capture
         dev_info = _mic_device_info()
-        print(f"  ✅ PyAudio + input stream initialized (warm start, idle-close={IDLE_CLOSE_SECONDS}s)")
-        log.info(f"  ✅ PyAudio initialized | Input device: {dev_info}")
+        print(f"  ✅ Audio initialized via parec (idle-close={IDLE_CLOSE_SECONDS}s)")
+        log.info(f"  ✅ parec initialized | Input device: {dev_info}")
         _schedule_idle_close(seconds=IDLE_CLOSE_SECONDS, reason="startup-idle")
     except Exception as e:
         log.error(f"  ❌ Audio initialization failed: {e}")
@@ -2107,9 +2100,7 @@ Config file: ~/.config/okawhisp/config.toml
     log.info("  ✅ Startup complete — watch mode ready")
 
     # Start watch thread here, after full init (model loaded, stream opened).
-    # This ensures _open_audio_stream() in the watch loop creates a fresh stream
-    # rather than trying to restart a warm-start-stopped BT HFP stream (which
-    # PipeWire would not re-activate on start_stream()).
+    # This ensures the watch loop gets a clean parec process.
     _start_watch_thread()
 
     if not listen_keyboard_hotkey(args.key):
@@ -2117,16 +2108,7 @@ Config file: ~/.config/okawhisp/config.toml
 
     # Cleanup on exit
     _cancel_idle_close_timer()
-    if _audio_stream is not None:
-        try:
-            _audio_stream.close()
-        except Exception:
-            pass
-    if _pyaudio_instance is not None:
-        try:
-            _pyaudio_instance.terminate()
-        except Exception:
-            pass
+    _close_audio_stream("shutdown")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,12 @@ model    = "medium"   # Whisper model: tiny | base | small | medium | large-v3
 language = "de"       # Language code or "auto" for auto-detect
 engine   = "faster"   # faster | openai | api
 beam_size = 5         # 1 = fast, 5 = accurate
-# device = 15         # PyAudio device index override (None = auto-detect pulse)
+# device = "bluez_input.XX_XX_XX_XX_XX_XX"  # Override mic device (default: system default)
+# Find source names with: pactl list sources short
+# Examples:
+#   Bluetooth:  "bluez_input.70_BF_92_27_20_A5"
+#   USB mic:    "alsa_input.usb-Blue_Yeti-00.analog-stereo"
+#   Onboard:    "alsa_input.pci-0000_00_1f.3.analog-stereo"
 # prompt = "Python, FastAPI, TypeScript"  # domain hints for better accuracy
 
 [vad]

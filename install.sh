@@ -5,6 +5,7 @@ set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/okahari/okawhisp/main"
 INSTALL_DIR="$HOME/.local/share/okawhisp"
+CONFIG_DIR="$HOME/.config/okawhisp"
 BIN_DIR="$HOME/.local/bin"
 SCRIPT="$INSTALL_DIR/okawhisp.py"
 
@@ -33,29 +34,26 @@ info "Checking system dependencies..."
 
 if [ "$PLATFORM" = "linux" ]; then
     MISSING=()
-    for cmd in xdotool pactl python3; do
+    for cmd in xdotool pactl parec python3; do
         command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
     done
 
     if [ ${#MISSING[@]} -gt 0 ]; then
         info "Installing missing packages: ${MISSING[*]}"
         if command -v apt-get &>/dev/null; then
-            sudo apt-get install -y xdotool pulseaudio-utils python3 \
-                portaudio19-dev python3-dev 2>/dev/null \
-                || warn "Auto-install failed. Run: sudo apt install xdotool portaudio19-dev python3-dev"
+            sudo apt-get install -y xdotool pulseaudio-utils python3 2>/dev/null \
+                || warn "Auto-install failed. Run: sudo apt install xdotool pulseaudio-utils"
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y xdotool pipewire-utils python3 \
-                portaudio-devel python3-devel 2>/dev/null \
-                || warn "Auto-install failed. Run: sudo dnf install xdotool portaudio-devel python3-devel"
+            sudo dnf install -y xdotool pulseaudio-utils python3 2>/dev/null \
+                || warn "Auto-install failed. Run: sudo dnf install xdotool pulseaudio-utils"
         elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm xdotool pipewire python portaudio 2>/dev/null \
-                || warn "Auto-install failed. Run: sudo pacman -S xdotool pipewire python portaudio"
+            sudo pacman -S --noconfirm xdotool libpulse python 2>/dev/null \
+                || warn "Auto-install failed. Run: sudo pacman -S xdotool libpulse python"
         elif command -v zypper &>/dev/null; then
-            sudo zypper install -y xdotool pipewire-utils python3 \
-                portaudio-devel 2>/dev/null \
+            sudo zypper install -y xdotool pulseaudio-utils python3 2>/dev/null \
                 || warn "Auto-install failed."
         else
-            warn "Unknown package manager. Install manually: ${MISSING[*]} + portaudio dev headers"
+            warn "Unknown package manager. Install manually: ${MISSING[*]}"
         fi
     fi
 
@@ -64,7 +62,7 @@ elif [ "$PLATFORM" = "macos" ]; then
         warn "Homebrew not found. Install from https://brew.sh for automatic dependency management."
     else
         command -v python3 &>/dev/null || brew install python3
-        brew list portaudio &>/dev/null 2>&1 || brew install portaudio
+        brew list pulseaudio &>/dev/null 2>&1 || brew install pulseaudio
     fi
 fi
 
@@ -86,11 +84,22 @@ ok "pip ready"
 info "Installing okawhisp script..."
 mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$INSTALL_DIR/sounds"
 curl -sSL "$REPO/okawhisp.py"        -o "$SCRIPT"
-chmod +x "$SCRIPT"
+curl -sSL "$REPO/okawhispctl.py"     -o "$INSTALL_DIR/okawhispctl.py"
+chmod +x "$SCRIPT" "$INSTALL_DIR/okawhispctl.py"
 curl -sSL "$REPO/sounds/start.mp3"   -o "$INSTALL_DIR/sounds/start.mp3"
 curl -sSL "$REPO/sounds/stop.mp3"    -o "$INSTALL_DIR/sounds/stop.mp3"
-ln -sf "$SCRIPT" "$BIN_DIR/okawhisp"
+ln -sf "$INSTALL_DIR/okawhispctl.py" "$BIN_DIR/okawhisp"
 ok "Script installed to $INSTALL_DIR"
+
+# ── 3b. Default config (only if none exists) ─────────────────────────────────
+if [ ! -f "$CONFIG_DIR/config.toml" ]; then
+    info "Creating default config..."
+    mkdir -p "$CONFIG_DIR"
+    curl -sSL "$REPO/config.example.toml" -o "$CONFIG_DIR/config.toml"
+    ok "Config created at $CONFIG_DIR/config.toml"
+else
+    ok "Config exists at $CONFIG_DIR/config.toml (preserved)"
+fi
 
 # ── 4. Python dependencies ───────────────────────────────────────────────────
 echo ""
@@ -115,7 +124,6 @@ check_and_install() {
 
 check_and_install "torch"
 check_and_install "numpy"
-check_and_install "pyaudio"
 check_and_install "faster-whisper"     "faster_whisper"
 check_and_install "silero-vad"         "silero_vad"
 check_and_install "pynput"
@@ -156,14 +164,7 @@ case "$WHISPER_MODEL" in
     *)        HF_REPO="Systran/faster-whisper-${WHISPER_MODEL}" ;;
 esac
 
-info "Selected: ${WHISPER_MODEL}"
-
 # ── 6. Pre-download Whisper model ────────────────────────────────────────────
-#
-# Download the model NOW (before starting the service) so the service
-# can start immediately without a download delay.
-# Shows per-file progress so the user can see what is happening.
-#
 echo ""
 info "Downloading Whisper model '${WHISPER_MODEL}' (once — cached for future starts)..."
 echo ""
@@ -264,6 +265,9 @@ PYEOF
 ok "Model ready"
 
 # ── 7. Install and start service ─────────────────────────────────────────────
+# All settings come from config.toml — no CLI args in the service file.
+# This means changes to config.toml take effect on service restart without
+# needing to re-run the installer.
 echo ""
 info "Installing user service (systemctl --user)..."
 
@@ -275,7 +279,7 @@ if [ "$PLATFORM" = "linux" ]; then
 
     if ! command -v systemctl &>/dev/null; then
         warn "systemd not found."
-        warn "Start manually: python3 $SCRIPT --key F9 --model $WHISPER_MODEL --engine faster"
+        warn "Start manually: python3 $SCRIPT"
     else
         SERVICE_DIR="$HOME/.config/systemd/user"
         SERVICE_FILE="$SERVICE_DIR/okawhisp.service"
@@ -283,14 +287,14 @@ if [ "$PLATFORM" = "linux" ]; then
 
         cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=OkaWhisp — System-Level Voice Input (F9 Hotkey)
+Description=OkaWhisp — System-Level Voice Input
 After=graphical-session.target pipewire.service
 StartLimitBurst=3
 StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${SCRIPT} --key F9 --model ${WHISPER_MODEL} --engine faster --language de --beam-size 5 --silence 2.0
+ExecStart=/usr/bin/python3 ${SCRIPT}
 Environment="DISPLAY=${DISPLAY_VAL}"
 Environment="XAUTHORITY=${XAUTH_VAL}"
 Environment="XDG_RUNTIME_DIR=/run/user/${UID_VAL}"
@@ -312,7 +316,6 @@ EOF
         systemctl --user enable okawhisp.service
 
         # Timestamp BEFORE starting — journal polling will only look at entries after this
-        # Use local time (no -u) — journalctl --since expects local time
         START_TIME="$(date +'%Y-%m-%d %H:%M:%S')"
 
         if systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
@@ -345,7 +348,7 @@ EOF
             fi
             if journalctl --user -u okawhisp.service \
                     --since "$START_TIME" --no-pager -o cat 2>/dev/null | \
-               grep -qiE "(Starting hotkey|🎹|Hotkey listener|PyAudio initialized|input stream)"; then
+               grep -qiE "(Starting hotkey|🎹|Hotkey listener|Audio initialized|parec initialized|input stream)"; then
                 READY=1
                 break
             fi
@@ -357,8 +360,15 @@ EOF
         wait "$STREAM_PID" 2>/dev/null
         echo ""
 
+        # Read hotkey from config for display
+        HOTKEY="ALT_GR"
+        if [ -f "$CONFIG_DIR/config.toml" ]; then
+            CFG_KEY="$(grep -E '^\s*key\s*=' "$CONFIG_DIR/config.toml" 2>/dev/null | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?.*/\1/' || true)"
+            [ -n "$CFG_KEY" ] && HOTKEY="$CFG_KEY"
+        fi
+
         if [ "$READY" -eq 1 ]; then
-            ok "Service ready! Press F9 to record."
+            ok "Service ready! Press ${HOTKEY} to record."
         elif ! systemctl --user is-active --quiet okawhisp.service 2>/dev/null; then
             warn "Service stopped. Check: journalctl --user -u okawhisp -f"
         else
@@ -384,9 +394,6 @@ elif [ "$PLATFORM" = "macos" ]; then
     <array>
         <string>/usr/bin/python3</string>
         <string>${SCRIPT}</string>
-        <string>--key</string><string>F9</string>
-        <string>--model</string><string>${WHISPER_MODEL}</string>
-        <string>--engine</string><string>faster</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
@@ -408,16 +415,13 @@ fi
 echo ""
 echo -e "${GREEN}  ✓ okawhisp installed and ready!${NC}"
 echo ""
-echo "  Press F9 to start recording."
-echo ""
 if [ "$PLATFORM" = "linux" ] && command -v systemctl &>/dev/null; then
     echo "  Logs:    journalctl --user -u okawhisp -f"
     echo "  Status:  systemctl --user status okawhisp"
     echo "  Restart: systemctl --user restart okawhisp"
-    echo "  Note:    always use --user (it is a user service, not system-level)"
 elif [ "$PLATFORM" = "macos" ]; then
     echo "  Logs:    tail -f ${INSTALL_DIR}/okawhisp.log"
     echo "  Restart: launchctl unload ${PLIST_FILE} && launchctl load ${PLIST_FILE}"
 fi
-echo "  Config:  ~/.config/okawhisp/config.toml"
+echo "  Config:  $CONFIG_DIR/config.toml"
 echo ""
