@@ -861,7 +861,89 @@ def _check_mic_ready(max_wait_s: float = 5.0, n_stable_reads: int = 3) -> bool:
             return True
 
     log.warning(f"  ⚠️  Microphone NOT ready after {max_wait_s:.1f}s ({attempts} attempts, nonzero={seen_nonzero})")
+    _diagnose_mic_failure()
     return False
+
+
+def _diagnose_mic_failure():
+    """Log PipeWire/Bluetooth diagnostics when mic fails readiness check."""
+    try:
+        # Default source
+        r = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True, timeout=3)
+        default_src = r.stdout.strip() if r.returncode == 0 else "(unknown)"
+        log.warning(f"  [DIAG] Default source: {default_src}")
+
+        # Source state
+        r = subprocess.run(["pactl", "list", "sources", "short"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 5:
+                    name, state = parts[1], parts[4]
+                    if "bluez" in name or name == default_src:
+                        log.warning(f"  [DIAG] Source: {name} → {state}")
+
+        # Default sink (output switch can break BT profile)
+        r = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True, timeout=3)
+        default_sink = r.stdout.strip() if r.returncode == 0 else "(unknown)"
+        is_bt_sink = "bluez" in default_sink
+        is_hdmi_sink = "hdmi" in default_sink.lower()
+        log.warning(f"  [DIAG] Default sink: {default_sink}")
+        if is_hdmi_sink and "bluez" in default_src:
+            log.warning(f"  [DIAG] ⚠ BT mic selected but output on HDMI — HFP profile likely broken")
+        elif not is_bt_sink and "bluez" in default_src:
+            log.warning(f"  [DIAG] ⚠ BT mic selected but output not on BT — profile mismatch possible")
+
+        # BT connection state via bluetoothctl
+        if "bluez" in default_src:
+            # Extract MAC from source name like bluez_input.50:C2:ED:10:A7:43
+            mac = default_src.replace("bluez_input.", "").replace("_", ":")
+            r = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if any(k in line for k in ("Name:", "Connected:", "UUID: Handsfree", "UUID: Audio")):
+                        log.warning(f"  [DIAG] BT: {line}")
+    except Exception as ex:
+        log.debug(f"  [DIAG] diagnostics failed: {ex}")
+
+
+def _try_bt_reconnect() -> bool:
+    """Attempt to fix a dead BT mic by disconnecting and reconnecting.
+
+    Returns True if mic is ready after reconnect.
+    """
+    try:
+        r = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True, timeout=3)
+        default_src = r.stdout.strip() if r.returncode == 0 else ""
+        if "bluez" not in default_src:
+            log.info("  [2] Not a BT mic — skipping reconnect")
+            return False
+
+        mac = default_src.replace("bluez_input.", "").replace("_", ":")
+        log.warning(f"  [2] Attempting BT reconnect for {mac}...")
+
+        r = subprocess.run(["bluetoothctl", "disconnect", mac],
+                           capture_output=True, text=True, timeout=5)
+        log.info(f"  [2] BT disconnect: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.returncode}")
+
+        time.sleep(2)
+
+        r = subprocess.run(["bluetoothctl", "connect", mac],
+                           capture_output=True, text=True, timeout=10)
+        log.info(f"  [2] BT connect: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.returncode}")
+
+        time.sleep(3)
+
+        _close_audio_stream("bt-reconnect")
+        _open_audio_stream()
+        mic_ready = _check_mic_ready(max_wait_s=5.0)
+        log.info(f"  [2] BT reconnect result: mic_ready={mic_ready}")
+        return mic_ready
+
+    except Exception as ex:
+        log.warning(f"  [2] BT reconnect failed: {ex}")
+        return False
 
 
 def _read_chunk(stream, n_samples: int, timeout: float = 5.0) -> bytes:
@@ -1500,7 +1582,11 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
             return
 
     if not mic_ready:
-        log.error("  [2] ❌ Mic not ready after retry — aborting")
+        # Try BT reconnect as last resort
+        mic_ready = _try_bt_reconnect()
+
+    if not mic_ready:
+        log.error("  [2] ❌ Mic not ready after all retries — aborting")
         notify("❌ Mic not ready", "Microphone not available", "critical")
         play_sound("mic_error")
         return
