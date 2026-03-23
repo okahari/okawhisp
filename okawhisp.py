@@ -1852,8 +1852,21 @@ def listen_keyboard_hotkey(hotkey):
         print(f"  📍 Method: pynput (global keyboard listener)")
         print(f"  📍 PTT mode: hold key ≥300ms = Push-to-Talk")
 
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            listener.join()
+        # Retry loop: restart listener if X11 connection breaks
+        # (e.g. screen lock, display manager restart, Xlib broken pipe)
+        while not should_exit:
+            try:
+                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                    listener.join()
+                if should_exit:
+                    break
+                log.warning("  ⚠ Hotkey listener exited unexpectedly — restarting in 3s...")
+                time.sleep(3)
+            except Exception as e:
+                if should_exit:
+                    break
+                log.warning(f"  ⚠ Hotkey listener error: {e} — restarting in 3s...")
+                time.sleep(3)
 
     except ImportError:
         return False
