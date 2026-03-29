@@ -203,6 +203,8 @@ _ptt_stop_requested = False  # PTT mode: stop when key released
 # Starts "warm" and closes after idle timeout (privacy + GNOME mic indicator).
 _audio_proc = None       # subprocess.Popen running parec
 _audio_stream = None     # alias for _audio_proc (record functions use this)
+_audio_epoch = 0         # incremented on each _open_audio_stream(); guards against
+                         # watch-loop closing a stream opened by the recording thread
 
 # Idle close policy (requested): 60s after app start and 60s after each recording stop.
 IDLE_CLOSE_SECONDS = 60
@@ -247,6 +249,7 @@ _PAT_TYPE_TO_TELEGRAM = (
 # Signals for event-based chime timing
 _recording_ready_event = threading.Event()
 _recording_stopped_event = threading.Event()
+_watch_yielded_event = threading.Event()  # set by watch-loop when it stops reading (WATCH_SUSPENDED)
 
 # ─── ALSA error suppression (once at startup) ──────────────
 # IMPORTANT: Set only ONCE, not on every recording!
@@ -354,6 +357,7 @@ def transcribe_faster_whisper(audio_np):
         ),
         no_speech_threshold=0.5,
         condition_on_previous_text=True,
+        repetition_penalty=1.2,
     )
 
     text = " ".join(segment.text.strip() for segment in segments)
@@ -648,7 +652,6 @@ def get_rms(data):
     if len(audio_data) == 0:
         return 0
     return np.sqrt(np.mean(audio_data.astype(np.float64) ** 2))
-
 
 
 def calibrate_silence_threshold(audio_stream, duration_s: float = 0.8) -> int:
@@ -972,7 +975,7 @@ def _read_chunk(stream, n_samples: int, timeout: float = 5.0) -> bytes:
 
 def _open_audio_stream():
     """Opens 16kHz mono input stream via parec (PulseAudio/PipeWire native)."""
-    global _audio_proc, _audio_stream
+    global _audio_proc, _audio_stream, _audio_epoch
 
     if _audio_proc is not None and _audio_proc.poll() is None:
         return  # already running
@@ -990,14 +993,24 @@ def _open_audio_stream():
     log.info(f"  Starting audio: {' '.join(cmd)}")
     _audio_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _audio_stream = _audio_proc
+    _audio_epoch += 1
     log.info(f"  ✅ Input stream opened | {_mic_device_info()}")
 
 
-def _close_audio_stream(reason: str = "idle-timeout"):
-    """Terminates the parec subprocess."""
+def _close_audio_stream(reason: str = "idle-timeout", epoch: int | None = None):
+    """Terminates the parec subprocess.
+
+    epoch: If given, only close when _audio_epoch still matches.  This prevents
+           the watch-loop error handler from killing a stream that the recording
+           thread just opened (different epoch).
+    """
     global _audio_proc, _audio_stream
 
     if _audio_proc is None:
+        return
+
+    if epoch is not None and epoch != _audio_epoch:
+        log.debug(f"  ↩ close_stream skipped ({reason}): epoch {epoch} != current {_audio_epoch}")
         return
 
     try:
@@ -1034,8 +1047,6 @@ def _schedule_idle_close(seconds: int = IDLE_CLOSE_SECONDS, reason: str = "idle-
         with _idle_timer_lock:
             _idle_close_timer = None
         # Defer close while recording or while watch loop is actively reading.
-        # Closing the stream while the watch loop blocks in read() causes a
-        # PortAudio segfault that kills the process.
         if _recording_lock.locked() or (WATCH_ACTIVE and not WATCH_SUSPENDED):
             _schedule_idle_close(seconds=seconds, reason=reason)
             return
@@ -1408,7 +1419,7 @@ def _watch_loop():
             WATCH_ACTIVE = False
             WATCH_UNTIL_TS = None
 
-        # Suspend/inactive: discard partial segment, sleep briefly
+        # Suspend/inactive: discard partial segment, signal yielded, sleep briefly
         if (not WATCH_ACTIVE) or _recording_lock.locked() or WATCH_SUSPENDED:
             if in_segment:
                 in_segment = False
@@ -1416,21 +1427,27 @@ def _watch_loop():
                 segment_chunk_count = 0
                 silence_streak = 0
                 log.debug("  [watch] segment discarded (suspended)")
+            _watch_yielded_event.set()
             time.sleep(0.05)
             continue
 
         # Ensure stream is open and active
         try:
             _cancel_idle_close_timer()
+            pre_epoch = _audio_epoch
             if _audio_proc is not None and _audio_proc.poll() is not None:
-                _close_audio_stream("watch-proc-dead")
+                _close_audio_stream("watch-proc-dead", epoch=pre_epoch)
             _open_audio_stream()
 
+            read_epoch = _audio_epoch  # snapshot before blocking read
             data = _read_chunk(_audio_stream, vad_chunk)
         except Exception as ex:
             msg = str(ex)
             if "stream ended" in msg.lower() or "terminated" in msg.lower():
-                _close_audio_stream("watch-stream-error")
+                # Only close if the stream is still the one we were reading
+                # from.  If the recording thread already opened a new parec
+                # (different epoch), closing here would kill THAT stream.
+                _close_audio_stream("watch-stream-error", epoch=read_epoch)
                 log.warning("  [watch] stream error -> recovering")
                 time.sleep(0.35)
                 continue
@@ -1510,7 +1527,6 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """
     global _ptt_stop_requested, WATCH_SUSPENDED, WATCH_ACTIVE
 
-    # Lock instead of bool: prevents race condition on rapid hotkey presses
     if not _recording_lock.acquire(blocking=False):
         log.debug("Hotkey ignored — recording already running (lock held)")
         return
@@ -1519,7 +1535,12 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     _ptt_stop_requested = False
     _recording_ready_event.clear()
     _recording_stopped_event.clear()
+    _watch_yielded_event.clear()
     WATCH_SUSPENDED = True
+
+    # Wait for the watch-loop to finish its current _read_chunk() so we can
+    # safely reuse the same parec stdout without two threads reading it.
+    _watch_yielded_event.wait(timeout=1.5)
 
     mode_str = "PTT" if ptt_mode else "Toggle"
     log.info("━" * 60)
@@ -1543,15 +1564,15 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
 def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     """Actual recording logic (runs under _recording_lock).
-    
+
     ptt_mode: If True, PTT mode - stop on key release, send with Enter at end.
     skip_start_sound: If True, start sound was already played externally.
     """
-    global _audio_proc, _audio_stream
 
     _cancel_idle_close_timer()
-    # Fresh parec process for recording (avoids pipe race with watch loop)
-    _close_audio_stream("recording-start")
+    # Reuse existing parec if running (avoids BT mic disruption on close/reopen).
+    # The epoch guard in _close_audio_stream prevents the watch-loop race condition
+    # that originally motivated the "fresh parec" approach.
     _open_audio_stream()
 
     # ── 1. Check stream status ─────────────────────────────────────
@@ -1638,8 +1659,11 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         frames = []
     finally:
         elapsed_record = time.time() - record_start_ts
-        _close_audio_stream("recording-end")
-        log.info(f"  [4] ⏹  Stream closed after {elapsed_record:.2f}s")
+        # Keep parec running — closing and reopening disrupts BT mic.
+        # The watch-loop will resume reading from the same stdout once
+        # WATCH_SUSPENDED is cleared.  Stale pipe data is harmless (VAD
+        # discards silence).
+        log.info(f"  [4] ⏹  Recording stopped after {elapsed_record:.2f}s")
         _recording_stopped_event.set()
 
     # ── 5. Stop-Sound ───────────────────────────────────────────────
@@ -1686,17 +1710,13 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
 
     log.info(f"  [7] 📝 [{lang}] ({elapsed_trans:.1f}s) {text}")
 
-    # ── 7b. Action triggers (watch-only) ───────────────────────
-    # Triggers only fire in watch mode, not during key-press recordings.
-    # During PTT/key recording the full text is typed normally.
-
     # ── 8. Type text into active window ─────────────────────────
     time.sleep(0.3)
     typed = type_text(text)
     if typed:
         notify("✅ Typed", text[:80])
         log.info("  [8] ✅ Text typed into window")
-        
+
         # PTT mode: press Enter to send
         if ptt_mode:
             time.sleep(0.1)
@@ -1737,7 +1757,7 @@ def listen_keyboard_hotkey(hotkey):
 
         hotkey_norm = hotkey.upper().replace('-', '_').replace(' ', '_')
         target_key = key_map.get(hotkey_norm)
-        
+
         # AltGr special handling: on Linux/X11 systems AltGr can be various keysyms
         # See: /usr/include/X11/keysymdef.h
         altgr_vk_codes = {
@@ -1750,7 +1770,7 @@ def listen_keyboard_hotkey(hotkey):
             65514,  # 0xFFEA = XK_Alt_R (alternative)
         }
         is_altgr_hotkey = hotkey_norm in ('ALT_GR', 'ALTGR', 'RIGHT_ALT', 'RALT')
-        
+
         if not target_key and not is_altgr_hotkey:
             print(f"  ❌ Unknown hotkey: {hotkey}")
             print(f"     Available: {', '.join(sorted(set(key_map.keys())))}")
@@ -1774,20 +1794,20 @@ def listen_keyboard_hotkey(hotkey):
         def on_press(key):
             if not is_hotkey(key):
                 return
-            
+
             # Debug: Log every hotkey press
             log.debug(f"🔑 Hotkey PRESS detected: {key}")
-            
+
             # Already recording? Ignore
             if _recording_lock.locked():
                 log.debug("🔑 Ignored (recording in progress)")
                 return
-            
+
             # Record press time for PTT detection
             if ptt_state['press_time'] is None:
                 ptt_state['press_time'] = time.time()
                 ptt_state['ptt_active'] = False
-                
+
                 # Start delayed PTT check
                 def check_ptt():
                     time.sleep(ptt_state['ptt_threshold'])
@@ -1812,23 +1832,23 @@ def listen_keyboard_hotkey(hotkey):
                                 log.warning("  [ptt] ready-event timeout; playing start chime fallback")
                             play_sound("record_start")
                         threading.Thread(target=_late_ptt_chime, daemon=True).start()
-                
+
                 threading.Thread(target=check_ptt, daemon=True).start()
 
         def on_release(key):
             if not is_hotkey(key):
                 return
-            
+
             # Debug: Log every hotkey release
             log.debug(f"🔑 Hotkey RELEASE detected: {key}")
-            
+
             press_duration = time.time() - ptt_state['press_time'] if ptt_state['press_time'] else 0
             was_ptt = ptt_state['ptt_active']
-            
+
             # Reset state
             ptt_state['press_time'] = None
             ptt_state['ptt_active'] = False
-            
+
             if was_ptt:
                 # PTT mode: request stop, then play stop sound when stream actually stopped.
                 log.info(f"◀  PTT release after {press_duration:.1f}s — Stopping")
