@@ -88,6 +88,8 @@ curl -sSL "$REPO/okawhispctl.py"     -o "$INSTALL_DIR/okawhispctl.py"
 chmod +x "$SCRIPT" "$INSTALL_DIR/okawhispctl.py"
 curl -sSL "$REPO/sounds/start.mp3"   -o "$INSTALL_DIR/sounds/start.mp3"
 curl -sSL "$REPO/sounds/stop.mp3"    -o "$INSTALL_DIR/sounds/stop.mp3"
+curl -sSL "$REPO/okawhisp-launcher.sh" -o "$BIN_DIR/okawhisp-launcher.sh"
+chmod +x "$BIN_DIR/okawhisp-launcher.sh"
 ln -sf "$INSTALL_DIR/okawhispctl.py" "$BIN_DIR/okawhisp"
 ok "Script installed to $INSTALL_DIR"
 
@@ -271,10 +273,6 @@ ok "Model ready"
 echo ""
 info "Installing user service (systemctl --user)..."
 
-DISPLAY_VAL="${DISPLAY:-:0}"
-XAUTH_VAL="${XAUTHORITY:-$HOME/.Xauthority}"
-UID_VAL="$(id -u)"
-
 if [ "$PLATFORM" = "linux" ]; then
 
     if ! command -v systemctl &>/dev/null; then
@@ -294,11 +292,7 @@ StartLimitIntervalSec=60s
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${SCRIPT}
-Environment="DISPLAY=${DISPLAY_VAL}"
-Environment="XAUTHORITY=${XAUTH_VAL}"
-Environment="XDG_RUNTIME_DIR=/run/user/${UID_VAL}"
-Environment="PYTHONUNBUFFERED=1"
+ExecStart=%h/.local/bin/okawhisp-launcher.sh
 Environment="CUDA_VISIBLE_DEVICES=0"
 Restart=always
 RestartSec=5s

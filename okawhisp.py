@@ -1736,6 +1736,11 @@ def listen_keyboard_hotkey(hotkey):
         from pynput import keyboard
 
         alt_gr_key = getattr(keyboard.Key, 'alt_gr', None) or getattr(keyboard.Key, 'alt_r', None)
+        if alt_gr_key is None:
+            try:
+                alt_gr_key = keyboard.KeyCode.from_vk(65027)
+            except Exception:
+                alt_gr_key = None
 
         key_map = {
             'F1': keyboard.Key.f1, 'F2': keyboard.Key.f2,
@@ -1758,6 +1763,22 @@ def listen_keyboard_hotkey(hotkey):
         hotkey_norm = hotkey.upper().replace('-', '_').replace(' ', '_')
         target_key = key_map.get(hotkey_norm)
 
+        def _extract_vk(key_obj):
+            if key_obj is None:
+                return None
+            vk = getattr(key_obj, 'vk', None)
+            if vk is not None:
+                return vk
+            value = getattr(key_obj, 'value', None)
+            if value is not None:
+                vk = getattr(value, 'vk', None)
+                if vk is not None:
+                    return vk
+            scan_code = getattr(key_obj, 'scan_code', None)
+            if scan_code is not None:
+                return scan_code
+            return None
+
         # AltGr special handling: on Linux/X11 systems AltGr can be various keysyms
         # See: /usr/include/X11/keysymdef.h
         altgr_vk_codes = {
@@ -1769,6 +1790,9 @@ def listen_keyboard_hotkey(hotkey):
             65513,  # 0xFFE9 = XK_Alt_L
             65514,  # 0xFFEA = XK_Alt_R (alternative)
         }
+        altgr_key_vk = _extract_vk(alt_gr_key)
+        if altgr_key_vk:
+            altgr_vk_codes.add(altgr_key_vk)
         is_altgr_hotkey = hotkey_norm in ('ALT_GR', 'ALTGR', 'RIGHT_ALT', 'RALT')
 
         if not target_key and not is_altgr_hotkey:
@@ -1787,8 +1811,10 @@ def listen_keyboard_hotkey(hotkey):
             """Check if key matches configured hotkey"""
             if target_key and key == target_key:
                 return True
-            if is_altgr_hotkey and hasattr(key, 'vk') and key.vk in altgr_vk_codes:
-                return True
+            if is_altgr_hotkey:
+                key_vk = _extract_vk(key)
+                if key_vk in altgr_vk_codes:
+                    return True
             return False
 
         def on_press(key):

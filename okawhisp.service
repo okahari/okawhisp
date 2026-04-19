@@ -9,13 +9,7 @@ StartLimitIntervalSec=60s
 Type=simple
 # NOTE: This is a template for local dev.
 # The installer (install.sh) generates the actual service file with correct paths.
-ExecStart=/usr/bin/env bash -c 'uv run ~/.local/share/okawhisp/okawhisp.py --key F9 --model large-v3 --engine faster --language de'
-
-# X11 + Audio access
-Environment="DISPLAY=:1"
-Environment="XAUTHORITY=/home/okahari/.Xauthority"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
-Environment="PYTHONUNBUFFERED=1"
+ExecStart=%h/.local/bin/okawhisp-launcher.sh
 Environment="CUDA_VISIBLE_DEVICES=0"
 
 Restart=always
