@@ -911,10 +911,200 @@ def _diagnose_mic_failure():
         log.debug(f"  [DIAG] diagnostics failed: {ex}")
 
 
+def _get_bt_card_state(mac: str) -> tuple[str, str] | None:
+    """Returns (card_name, active_profile_name) for a Bluetooth device, or None.
+
+    The card name is what `pactl set-card-profile` expects.  The profile name
+    follows PulseAudio conventions:
+      - `a2dp-sink` / `a2dp_sink`           → high-quality output, no mic
+      - `headset-head-unit[-cvsd|-msbc]`    → mono output + mic (HFP)
+      - `off`                                → device disabled
+    """
+    try:
+        card_name = f"bluez_card.{mac.replace(':', '_')}"
+        r = subprocess.run(["pactl", "list", "cards", "short"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0 or card_name not in r.stdout:
+            return None
+        r = subprocess.run(["pactl", "list", "cards"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return None
+        in_card = False
+        for line in r.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                in_card = (card_name in stripped)
+            elif in_card and (stripped.startswith("Active Profile:") or
+                              stripped.startswith("Aktives Profil:")):
+                profile = stripped.split(":", 1)[1].strip()
+                return (card_name, profile)
+    except Exception as ex:
+        log.debug(f"  BT card state query failed: {ex}")
+    return None
+
+
+def _is_a2dp_profile(profile: str) -> bool:
+    """True if profile is A2DP (playback, no mic)."""
+    return "a2dp" in profile.lower()
+
+
+def _is_headset_profile(profile: str) -> bool:
+    """True if profile is HSP/HFP (mic available, mono output)."""
+    return "headset" in profile.lower() or "hfp" in profile.lower() or "hsp" in profile.lower()
+
+
+def _set_bt_profile(card: str, profile: str) -> bool:
+    """Set a Bluetooth card profile via pactl. Returns True on success."""
+    try:
+        r = subprocess.run(["pactl", "set-card-profile", card, profile],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True
+        log.warning(f"  pactl set-card-profile {card} {profile} failed: {r.stderr.strip()}")
+    except Exception as ex:
+        log.warning(f"  set-card-profile exception: {ex}")
+    return False
+
+
+def _find_headset_profile_on_card(card: str) -> str | None:
+    """Returns the highest-priority headset profile name available on a card."""
+    try:
+        r = subprocess.run(["pactl", "list", "cards"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return None
+        in_card = False
+        in_profiles = False
+        best = None
+        best_priority = -1
+        for line in r.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                in_card = (card in stripped)
+                in_profiles = False
+            elif in_card and (stripped.startswith("Profiles:") or stripped.startswith("Profile:")):
+                in_profiles = True
+            elif in_card and in_profiles and ":" in stripped:
+                # Lines like:  headset-head-unit: ... (priority: 3, ...
+                if not _is_headset_profile(stripped.split(":")[0]):
+                    continue
+                name = stripped.split(":")[0].strip()
+                m = re.search(r"priority[:\s]+(\d+)", stripped)
+                prio = int(m.group(1)) if m else 0
+                if prio > best_priority:
+                    best = name
+                    best_priority = prio
+        return best
+    except Exception as ex:
+        log.debug(f"  Profile enumeration failed: {ex}")
+        return None
+
+
+def _find_a2dp_profile_on_card(card: str) -> str | None:
+    """Returns the highest-priority A2DP sink profile name available on a card."""
+    try:
+        r = subprocess.run(["pactl", "list", "cards"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            return None
+        in_card = False
+        in_profiles = False
+        best = None
+        best_priority = -1
+        for line in r.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                in_card = (card in stripped)
+                in_profiles = False
+            elif in_card and (stripped.startswith("Profiles:") or stripped.startswith("Profile:")):
+                in_profiles = True
+            elif in_card and in_profiles and ":" in stripped:
+                if not _is_a2dp_profile(stripped.split(":")[0]):
+                    continue
+                name = stripped.split(":")[0].strip()
+                m = re.search(r"priority[:\s]+(\d+)", stripped)
+                prio = int(m.group(1)) if m else 0
+                if prio > best_priority:
+                    best = name
+                    best_priority = prio
+        return best
+    except Exception as ex:
+        log.debug(f"  A2DP profile enumeration failed: {ex}")
+        return None
+
+
+# Tracks profile switches we performed so we can restore them after recording.
+# Maps card_name → previous_a2dp_profile_name.  Only populated when WE switched.
+_bt_profile_switches: dict[str, str] = {}
+
+
+def _maybe_switch_bt_to_headset() -> bool:
+    """If the active default-source BT device is in A2DP, switch it to HSP/HFP.
+
+    Records the original profile in _bt_profile_switches so it can be restored
+    after recording.  Does NOT touch devices that are already in a headset
+    profile — the user may have deliberately chosen that, and we respect it.
+
+    Returns True if a switch was performed (caller should expect a brief delay
+    before mic data is available).
+    """
+    try:
+        r = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True, timeout=3)
+        default_src = r.stdout.strip() if r.returncode == 0 else ""
+        if "bluez" not in default_src:
+            return False
+        mac = default_src.replace("bluez_input.", "").replace("_", ":")
+        state = _get_bt_card_state(mac)
+        if state is None:
+            return False
+        card, profile = state
+        if not _is_a2dp_profile(profile):
+            return False  # already in headset or off — leave it alone
+
+        target = _find_headset_profile_on_card(card)
+        if not target:
+            log.warning(f"  No headset profile available on {card} — cannot switch from A2DP")
+            return False
+
+        log.info(f"  🎚  BT profile switch: {profile} → {target} (will restore after recording)")
+        if not _set_bt_profile(card, target):
+            return False
+        _bt_profile_switches[card] = profile
+        time.sleep(0.8)  # let BT transport stabilize before reading
+        return True
+    except Exception as ex:
+        log.warning(f"  BT profile switch failed: {ex}")
+        return False
+
+
+def _restore_bt_profile_if_switched():
+    """Restore any BT card profiles we switched away from. Crash-safe (try/except)."""
+    if not _bt_profile_switches:
+        return
+    for card, original in list(_bt_profile_switches.items()):
+        try:
+            # Verify the original profile still exists on the card
+            target = original if _is_a2dp_profile(original) else _find_a2dp_profile_on_card(card)
+            if target and _set_bt_profile(card, target):
+                log.info(f"  🎚  BT profile restored: {card} → {target}")
+            else:
+                log.warning(f"  Could not restore profile {original} on {card}")
+        except Exception as ex:
+            log.warning(f"  Profile restore failed for {card}: {ex}")
+        finally:
+            _bt_profile_switches.pop(card, None)
+
+
 def _try_bt_reconnect() -> bool:
     """Attempt to fix a dead BT mic by disconnecting and reconnecting.
 
     Returns True if mic is ready after reconnect.
+
+    SAFETY: Refuses to reconnect when the BT device is in an A2DP profile —
+    a reconnect would tear down A2DP and force HFP, destroying the user's
+    high-quality audio.  In that case we expect the caller to have done a
+    clean profile switch first via _maybe_switch_bt_to_headset().
     """
     try:
         r = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True, timeout=3)
@@ -924,6 +1114,14 @@ def _try_bt_reconnect() -> bool:
             return False
 
         mac = default_src.replace("bluez_input.", "").replace("_", ":")
+
+        # Stage-1 safety: never reconnect a device that's currently in A2DP —
+        # the reconnect would destroy the A2DP transport.
+        state = _get_bt_card_state(mac)
+        if state is not None and _is_a2dp_profile(state[1]):
+            log.warning(f"  [2] BT device in A2DP profile ({state[1]}) — refusing reconnect to preserve audio quality")
+            return False
+
         log.warning(f"  [2] Attempting BT reconnect for {mac}...")
 
         r = subprocess.run(["bluetoothctl", "disconnect", mac],
@@ -1548,6 +1746,9 @@ def do_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
     try:
         _run_voice_input(ptt_mode=ptt_mode, skip_start_sound=skip_start_sound)
     finally:
+        # Restore any BT profile we temporarily switched (A2DP → HFP) so the
+        # speaker returns to high-quality playback mode.  Runs even on crash.
+        _restore_bt_profile_if_switched()
         _ptt_stop_requested = False
         WATCH_SUSPENDED = False
         # Key press always re-enables watch mode if it was disabled.
@@ -1582,6 +1783,14 @@ def _run_voice_input(ptt_mode: bool = False, skip_start_sound: bool = False):
         log.error("  [1] ❌ parec failed to start")
         notify("❌ Audio error", "parec not running", "critical")
         return
+
+    # ── 1b. If a BT speaker is in A2DP (playback) profile, switch it to a
+    # headset profile so its mic transport becomes available.  The switch is
+    # tracked and reverted in do_voice_input's finally block after recording.
+    # Devices already in a headset profile are left alone (user's choice).
+    if _maybe_switch_bt_to_headset():
+        _close_audio_stream("bt-profile-switch")
+        _open_audio_stream()
 
     # ── 2. Device readiness check (wait for Bluetooth reconnect) ───
     log.info(f"  [2] Checking if microphone delivers real data...")
